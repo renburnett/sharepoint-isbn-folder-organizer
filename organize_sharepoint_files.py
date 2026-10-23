@@ -6,8 +6,11 @@ from pathlib import Path
 
 import ebooklib
 import pymupdf
-import pytesseract
 import requests
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = (
+  r"C:\Users\006888191SA\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+)
 
 from bs4 import BeautifulSoup
 from docx import Document
@@ -39,8 +42,12 @@ class TextbookCatalogingService:
 
   SUPPORTED_EXTENSIONS = {"pdf", "tif", "tiff", "epub", "docx"}
 
+  PHONE_PATTERN = re.compile(
+    r"(?<!\d)\(?\d{3}\)?[^\dA-Za-z]+\d{3}[^\dA-Za-z]+\d{4}(?!\d)"
+  )
+
   ISBN_PATTERN = re.compile(
-    r"(?<!\d)(?:97[89][ -]?)?(?:\d[ -]?){9}[\dXx](?!\d)"
+    r"(?<!\d)(?:97[89][^\dA-Za-z]?)?(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)"
   )
 
   def lookup_isbn(self, isbn):
@@ -48,7 +55,7 @@ class TextbookCatalogingService:
     response = requests.get(url, timeout=10)
 
     print("---")
-    print('response.json()', response.json())
+    print('lookup_isbn :response.json()', response.json())
     print("---")
 
     if response.status_code == 404:
@@ -611,12 +618,15 @@ class TextbookCatalogingService:
     else:
       raise ValueError(f"Unsupported file type: {extension}")
 
-    match = self.ISBN_PATTERN.search("\n".join(text_parts))
+    text = "\n".join(text_parts)
 
-    if not match:
-      return None
+    for match in self.ISBN_PATTERN.finditer(text):
+      if self.PHONE_PATTERN.fullmatch(match.group()):
+        continue
 
-    return re.sub(r"[^0-9Xx]", "", match.group()).upper()
+      return re.sub(r"[^0-9Xx]", "", match.group()).upper()
+
+    return None
 
   def __init__(self):
     # Use the Windows Downloads folder.
