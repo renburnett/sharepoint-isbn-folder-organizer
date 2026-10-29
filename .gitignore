@@ -1,5 +1,3 @@
 config.py
-test_browser.py
-sharepoint_listing.txt
 __pycache__/
 *.py[cod]
