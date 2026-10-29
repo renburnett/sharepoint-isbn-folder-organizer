@@ -1,0 +1,50 @@
+2026-10-29 10:24:59,503 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 10:25:17,546 WARNING Found ISBN in title '9781483359588.pdf': 9781483359588
+2026-10-29 10:25:17,547 ERROR Unexpected error (AttributeError): 'ApiService' object has no attribute 'api_rate_limiter'
+Traceback (most recent call last):
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\organize_sharepoint_files.py", line 916, in __init__
+    result = self.inspect_open_folder(driver, wait, book_folder)
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\organize_sharepoint_files.py", line 148, in inspect_open_folder
+    catalog = self.api.lookup_isbn(isbn)
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\utils\api_service.py", line 32, in lookup_isbn
+    self.api_rate_limiter.wait()
+    ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'ApiService' object has no attribute 'api_rate_limiter'
+2026-10-29 10:30:06,145 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 10:30:21,998 WARNING Found ISBN in title '9781483359588.pdf': 9781483359588
+2026-10-29 10:30:22,741 INFO Catalog lookup result: {'notes': {'type': '/type/text', 'value': 'Includes bibliographical references and index.'}, 'title': 'Adventures in social research', 'subtitle': 'data analysis using IBM SPSS statistics', 'authors': [{'key': '/authors/OL227821A'}], 'publish_date': '2015', 'publishers': ['SAGE'], 'full_title': 'Adventures in social research data analysis using IBM SPSS statistics', 'lc_classifications': ['HA32 .B286 2015', 'HA32.B286 2015'], 'publish_places': ['Los Angeles'], 'contributions': ['Wagner, William E. (William Edward)', 'Zaino, Jeanne'], 'edition_name': '9th edition.', 'pagination': 'pages cm', 'source_records': ['marc:marc_loc_2016/BooksAll.2016.part41.utf8:213145263:1002', 'bwb:9781483359588', 'ia:adventuresinsoci0000babb_n4l2', 'promise:bwb_daily_pallets_2021-04-01'], 'lccn': ['2014048501'], 'isbn_13': ['9781483359588'], 'languages': [{'key': '/languages/eng'}], 'dewey_decimal_class': ['300.285/555'], 'subjects': ['Social sciences', 'Statistical methods', 'Computer programs', 'SPSS for Windows'], 'publish_country': 'cau', 'by_statement': 'Earl Babbie, William E. Wagner, III, Jeanne Zaino', 'type': {'key': '/type/edition'}, 'ocaid': 'adventuresinsoci0000babb_n4l2', 'key': '/books/OL31063183M', 'works': [{'key': '/works/OL18640134W'}], 'local_id': ['urn:bwbsku:O7-BGU-752'], 'covers': [13090310], 'latest_revision': 5, 'revision': 5, 'created': {'type': '/type/datetime', 'value': '2020-11-13T08:06:14.574496'}, 'last_modified': {'type': '/type/datetime', 'value': '2022-12-14T15:59:13.278844'}}
+2026-10-29 10:48:22,470 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 10:48:38,604 ERROR Unexpected error (AttributeError): 'dict' object has no attribute 'set'
+Traceback (most recent call last):
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\organize_sharepoint_files.py", line 927, in __init__
+    result = self.inspect_open_folder(driver, wait, book_folder)
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\organize_sharepoint_files.py", line 152, in inspect_open_folder
+    isbn = isbn_from_title(item, pattern)
+  File "C:\Users\006888191SA\Documents\Projects\SharePointSelenium\organize_sharepoint_files.py", line 139, in isbn_from_title
+    item.set("format", file_format)
+    ^^^^^^^^
+AttributeError: 'dict' object has no attribute 'set'. Did you mean: 'get'?
+2026-10-29 10:49:07,193 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 10:49:22,488 INFO Catalog lookup result: {'title': '9433229601', 'modified_by': 'Jonah Coloma', 'format': [], 'book_title': None, 'author': None, 'publisher': None, 'edition': None, 'is_folder': True, '_elements': {'row': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.125")>, 'title': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.88")>, 'modified_by': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.208")>, 'format': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.209")>, 'book_title': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.210")>, 'author': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.211")>, 'publisher': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.212")>, 'edition': <selenium.webdriver.remote.webelement.WebElement (session="ad832308c202954ef20e160a9f2a858a", element="f.ADE952667F83571A4BEF8948B60D1BD2.d.D4DD5E74AA62FF8347A568D0DCFDB092.e.213")>}}
+2026-10-29 12:17:47,819 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 12:18:06,804 WARNING Unexpected subfolder; inspecting its listing and stopping: 0130477222
+2026-10-29 12:18:10,516 ERROR Contents of '0130477222': ['[folder] Win Word 97']
+2026-10-29 12:18:10,516 INFO Catalog lookup result: None
+2026-10-29 12:28:26,264 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 12:28:43,358 WARNING Unexpected subfolder; inspecting its listing: 0130477222
+2026-10-29 12:28:47,128 INFO Opening its single subfolder: Win Word 97
+2026-10-29 12:28:55,030 INFO Found ISBN in untyped item '0130477222': 0130477222
+2026-10-29 12:28:55,401 INFO Catalog lookup result: {'identifiers': {'librarything': ['1108816'], 'goodreads': ['641618']}, 'title': 'Advertising', 'subtitle': 'Principles and Practice (6th Edition)', 'authors': [{'key': '/authors/OL1821680A'}, {'key': '/authors/OL2650402A'}, {'key': '/authors/OL2650403A'}], 'publish_date': 'October 29, 2002', 'publishers': ['Prentice Hall'], 'languages': [{'key': '/languages/eng'}], 'covers': [83414], 'isbn_13': ['9780130477224'], 'isbn_10': ['0130477222'], 'type': {'key': '/type/edition'}, 'source_records': ['amazon:0130477222'], 'key': '/books/OL7332079M', 'number_of_pages': 640, 'works': [{'key': '/works/OL2729922W'}], 'latest_revision': 7, 'revision': 7, 'created': {'type': '/type/datetime', 'value': '2008-04-29T13:35:46.876380'}, 'last_modified': {'type': '/type/datetime', 'value': '2026-02-04T19:53:34.010388'}}
+2026-10-29 12:44:21,497 INFO 
+Edge opened your SharePoint folder.
+2026-10-29 12:44:38,768 INFO Opening format folder: Split PDF
+2026-10-29 12:44:45,966 INFO Found a possible matter file: 00_Front Matter.pdf
+2026-10-29 12:44:47,823 INFO Downloaded: C:\Users\006888191SA\Downloads\00_Front Matter (3).pdf
+2026-10-29 12:44:48,947 INFO Found ISBN in downloaded file '00_Front Matter.pdf': 9780743270489
+2026-10-29 12:44:50,035 INFO Catalog lookup result: {'publishers': ['Scribner'], 'subtitle': 'a novel', 'ia_box_id': ['IA152301'], 'ia_loaded_id': ['modelhomenovel00puch'], 'lc_classifications': ['PS3616.U25 M63 2010'], 'key': '/books/OL24448667M', 'authors': [{'key': '/authors/OL2820593A'}], 'publish_places': ['New York'], 'languages': [{'key': '/languages/eng'}], 'pagination': '360 p. ;', 'source_records': ['marc:marc_loc_updates/v38.i23.records.utf8:8453122:634', 'ia:modelhomenovel00puch', 'marc:marc_openlibraries_sanfranciscopubliclibrary/sfpl_chq_2018_12_24_run04.mrc:38109600:3898', 'marc:marc_loc_2016/BooksAll.2016.part36.utf8:141190431:639', 'ia:modelhomenovel0000puch', 'marc:marc_columbia/Columbia-extract-20221130-016.mrc:56224209:2574', 'marc:harvard_bibliographic_metadata/ab.bib.12.20150123.full.mrc:239722916:820'], 'title': 'Model home', 'lccn': ['2009038051'], 'number_of_pages': 360, 'isbn_13': ['9780743270489'], 'edition_name': '1st Scribner hardcover ed.', 'dewey_decimal_class': ['813/.6'], 'local_id': ['urn:sfpl:31223099334493', 'urn:sfpl:31223099326366', 'urn:sfpl:31223099326010', 'urn:sfpl:31223099327398', 'urn:sfpl:31223099334808', 'urn:sfpl:31223088553202', 'urn:sfpl:31223085001726', 'urn:sfpl:31223099326135', 'urn:sfpl:31223099335672', 'urn:sfpl:31223099334162', 'urn:sfpl:31223099327539', 'urn:sfpl:31223099327794', 'urn:sfpl:31223099327984'], 'publish_date': '2010', 'publish_country': 'nyu', 'by_statement': 'Eric Puchner', 'works': [{'key': '/works/OL15484196W'}], 'type': {'key': '/type/edition'}, 'covers': [10649785], 'ocaid': 'modelhomenovel0000puch', 'oclc_numbers': ['424555283'], 'latest_revision': 7, 'revision': 7, 'created': {'type': '/type/datetime', 'value': '2010-11-19T01:23:41.580011'}, 'last_modified': {'type': '/type/datetime', 'value': '2023-01-01T23:34:02.424744'}}
