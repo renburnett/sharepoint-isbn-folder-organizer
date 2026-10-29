@@ -48,7 +48,6 @@ class TextbookCatalogingService:
     ISBN_13_PATTERN = re.compile(r"(?<!\d)97[89](?:[^\dA-Za-z]?\d){10}(?!\d)")
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
-    GOOGLE_BOOKS_FALLBACK_ENABLED = True
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -137,6 +136,9 @@ class TextbookCatalogingService:
                 .replace("-", " ")
             )
 
+        def title_tokens(item):
+            return set(re.findall(r"[a-z0-9]+", normalized_title(item)))
+
         def formats_in(item):
             formats = set()
             format_text = str(item.get("format") or "").casefold()
@@ -150,8 +152,8 @@ class TextbookCatalogingService:
             elif not item.get("is_folder") and format_tokens and not formats:
                 formats.add("other")
 
-            title_tokens = set(re.findall(r"[a-z0-9]+", normalized_title(item)))
-            formats.update(title_tokens & supported_extensions)
+            title_format_tokens = title_tokens(item)
+            formats.update(title_format_tokens & supported_extensions)
             return formats
 
         def record_formats(items):
@@ -204,19 +206,19 @@ class TextbookCatalogingService:
         contents = []
         used_unexpected_nesting = False
 
-        if unexpected_folders:
+        if unexpected_folders and not format_folders:
             unexpected_folder = unexpected_folders[0]
             self.logger.write(
                 "Unexpected subfolder; inspecting its listing:",
                 unexpected_folder.get("title"),
-                level=logging.WARNING,
+                level=logging.INFO,
             )
 
             self.open_folder(driver, wait, unexpected_folder)
             unexpected_contents = self.get_folders_to_update(driver)
             record_formats(unexpected_contents)
 
-            # NOTE: Allow one extra level when the unexpected folder contains only one folder.
+            # Allow one extra level when the unexpected folder contains only one folder.
             child_folders = [
                 item for item in unexpected_contents if item.get("is_folder")
             ]
@@ -231,7 +233,6 @@ class TextbookCatalogingService:
 
                 self.open_folder(driver, wait, child_folder)
                 contents = self.get_folders_to_update(driver)
-
                 record_formats(contents)
 
                 if any(item.get("is_folder") for item in contents):
@@ -239,7 +240,7 @@ class TextbookCatalogingService:
                         f"Unexpected deeper folder(s) inside "
                         f"{child_folder['title']!r}. "
                         f"Contents: {listing(contents)}",
-                        level=logging.ERROR,
+                        level=logging.WARNING,
                     )
                     # TODO: recurse through all folder levels at some point?
                     return None
@@ -251,7 +252,7 @@ class TextbookCatalogingService:
                     f"Unexpected subfolder structure in "
                     f"{unexpected_folder.get('title')!r}. "
                     f"Contents: {listing(unexpected_contents)}",
-                    level=logging.ERROR,
+                    level=logging.WARNING,
                 )
                 # TODO: recurse through all folder levels at some point?
                 return None
@@ -304,7 +305,7 @@ class TextbookCatalogingService:
                         f"Unexpected deeper folder(s) inside "
                         f"{supported_format_folder['title']!r}. "
                         f"Contents: {listing(contents)}",
-                        level=logging.ERROR,
+                        level=logging.WARNING,
                     )
                     # TODO: recurse through all folder levels once recursive handling is added.
                     return None
@@ -343,7 +344,9 @@ class TextbookCatalogingService:
         matter_files = [
             item
             for item in current_items
-            if not item.get("is_folder") and "matter" in normalized_title(item)
+            if not item.get("is_folder")
+            and "matter" in normalized_title(item)
+            and format_for(item) in {"pdf", "tif", "tiff", "docx", "epub"}
         ]
         matter_files.sort(
             key=lambda item: (
@@ -354,15 +357,11 @@ class TextbookCatalogingService:
         )
 
         front_matter_file = next(
-            (item for item in matter_files if "front" in normalized_title(item)),
+            (item for item in matter_files if "front" in title_tokens(item)),
             None,
         )
         end_matter_file = next(
-            (
-                item
-                for item in matter_files
-                if "end" in normalized_title(item) or "back" in normalized_title(item)
-            ),
+            (item for item in matter_files if {"end", "back"} & title_tokens(item)),
             None,
         )
         matter_file = (
@@ -381,8 +380,14 @@ class TextbookCatalogingService:
         downloaded_path = self.download_sharepoint_file(driver, wait, matter_file)
         self.logger.write("Downloaded:", downloaded_path)
 
-        title = normalized_title(matter_file)
-        matter_type = "end" if "end" in title or "back" in title else "front"
+        matter_tokens = title_tokens(matter_file)
+        if "front" in matter_tokens:
+            matter_type = "front"
+        elif {"end", "back"} & matter_tokens:
+            matter_type = "end"
+        else:
+            matter_type = "front"
+
         isbn = self.find_isbn_in_downloaded_file(downloaded_path, matter_type)
 
         if isbn:
