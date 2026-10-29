@@ -1,3 +1,5 @@
+from utils.logging_service import LogService
+from utils.api_service import ApiService
 from config import SID
 import time
 import ctypes
@@ -6,8 +8,8 @@ import re
 from pathlib import Path
 import ebooklib
 import pymupdf
-import requests
 import pytesseract
+import logging
 
 pytesseract.pytesseract.tesseract_cmd = (
     rf"C:\Users\{SID}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
@@ -39,26 +41,13 @@ class TextbookCatalogingService:
         "%2FAlternative%20Formats%2FTextbooks%2FArchives"
         "&sortField=BookTitle&isAscending=true"
     )
-    SUPPORTED_EXTENSIONS = {"pdf", "tif", "tiff", "epub", "docx"}
+    SUPPORTED_EXTENSIONS = {"pdf", "tif", "tiff", "epub", "docx", "doc"}
     PHONE_PATTERN = re.compile(
         r"(?<!\d)\(?\d{3}\)?[^\dA-Za-z]+\d{3}[^\dA-Za-z]+\d{4}(?!\d)"
     )
     ISBN_13_PATTERN = re.compile(r"(?<!\d)97[89](?:[^\dA-Za-z]?\d){10}(?!\d)")
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
-
-    def lookup_isbn(self, isbn):
-        url = f"https://openlibrary.org/isbn/{isbn}.json"
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 404:
-                print(f"ISBN {isbn} not found in Open Library.")
-                return None
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error looking up ISBN {isbn}: {e}")
-            return None
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -134,198 +123,283 @@ class TextbookCatalogingService:
         raise TimeoutError("The SharePoint folder listing did not finish loading.")
 
     def inspect_open_folder(self, driver, wait, current_folder):
-        # Get the items shown in the currently open folder.
+        supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
+        format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
+
         folders = self.get_folders_to_update(driver)
-
-        def isbn_from_title(item, pattern):
-            title = str(item.get("title") or "")
-            for match in pattern.finditer(title):
-                if self.PHONE_PATTERN.fullmatch(match.group()):
-                    continue
-                return re.sub(r"[^0-9Xx]", "", match.group()).upper()
-            return None
-
-        # Search all titles for ISBN-13 first, then ISBN-10.
-        for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
-            for item in folders:
-                isbn = isbn_from_title(item, pattern)
-                if isbn:
-                    print(f"Found ISBN in title {item.get('title')!r}: {isbn}")
-                    catalog = self.lookup_isbn(isbn)
-                    if catalog:
-                        return catalog
 
         def normalized_title(item):
             return (
-                (item.get("title") or "").casefold().replace("_", " ").replace("-", " ")
+                str(item.get("title") or "")
+                .casefold()
+                .replace("_", " ")
+                .replace("-", " ")
             )
+
+        def title_tokens(item):
+            return set(re.findall(r"[a-z0-9]+", normalized_title(item)))
 
         def formats_in(item):
             formats = set()
             format_text = str(item.get("format") or "").casefold()
-            formats.update(
-                token
-                for token in re.findall(r"[a-z0-9]+", format_text)
-                if token in self.SUPPORTED_EXTENSIONS
-            )
+            format_tokens = set(re.findall(r"[a-z0-9]+", format_text))
+            formats.update(format_tokens & supported_extensions)
 
-            title = item.get("title") or ""
-            title_extension = os.path.splitext(title)[1].casefold().lstrip(".")
-            if title_extension in self.SUPPORTED_EXTENSIONS:
-                formats.add(title_extension)
+            title = str(item.get("title") or "")
+            extension = os.path.splitext(title)[1].casefold().lstrip(".")
+            if extension:
+                formats.add(extension if extension in supported_extensions else "other")
+            elif not item.get("is_folder") and format_tokens and not formats:
+                formats.add("other")
 
-            title_tokens = re.findall(r"[a-z0-9]+", normalized_title(item))
-            formats.update(
-                token for token in title_tokens if token in self.SUPPORTED_EXTENSIONS
-            )
+            title_format_tokens = title_tokens(item)
+            formats.update(title_format_tokens & supported_extensions)
             return formats
 
-        # Store the formats found in this folder's files and subfolders.
-        current_folder["format"] = sorted(
-            {file_format for item in folders for file_format in formats_in(item)}
-        )
+        def record_formats(items):
+            formats = set(current_folder.get("format") or [])
+            for item in items:
+                formats.update(formats_in(item))
+            current_folder["format"] = sorted(formats)
 
-        # Prefer Split PDF over a folder named TIF, PDF, EPUB, etc.
-        split_pdf_folder = next(
-            (
-                item
-                for item in folders
-                if item.get("is_folder")
-                and "split" in normalized_title(item)
-                and "pdf" in normalized_title(item)
-            ),
-            None,
-        )
+        def format_for(item):
+            formats = formats_in(item)
+            for extension in format_priority:
+                if extension in formats:
+                    return extension
+            return "other" if "other" in formats else None
 
-        # If Split PDF isn't present, use the first supported-format folder.
-        supported_folder = None
-        if not split_pdf_folder:
-            supported_folder = next(
-                (
-                    item
-                    for item in folders
-                    if item.get("is_folder")
-                    and (
-                        (item.get("format") or "").strip().casefold()
-                        in self.SUPPORTED_EXTENSIONS
-                        or normalized_title(item).strip() in self.SUPPORTED_EXTENSIONS
-                        or os.path.splitext(normalized_title(item))[1]
-                        .casefold()
-                        .lstrip(".")
-                        in self.SUPPORTED_EXTENSIONS
-                    )
-                ),
-                None,
+        def listing(items):
+            return [
+                f"{'[folder]' if item.get('is_folder') else '[file]'} "
+                f"{item.get('title') or '(untitled)'}"
+                for item in items
+            ]
+
+        def isbn_from_title(item, pattern):
+            title = str(item.get("title") or "")
+            file_format = format_for(item)
+            item["format"] = item.get("format") or file_format
+
+            for match in pattern.finditer(title):
+                if self.PHONE_PATTERN.fullmatch(match.group()):
+                    continue
+                isbn = re.sub(r"[^0-9Xx]", "", match.group()).upper()
+                return isbn, file_format
+
+            return None, file_format
+
+        # Record formats from the current folder's files and subfolders.
+        record_formats(folders)
+
+        format_folders = [
+            item
+            for item in folders
+            if item.get("is_folder") and formats_in(item) & supported_extensions
+        ]
+        unexpected_folders = [
+            item
+            for item in folders
+            if item.get("is_folder") and item not in format_folders
+        ]
+
+        contents = []
+        used_unexpected_nesting = False
+
+        if unexpected_folders and not format_folders:
+            unexpected_folder = unexpected_folders[0]
+            self.logger.write(
+                "Unexpected subfolder; inspecting its listing:",
+                unexpected_folder.get("title"),
+                level=logging.INFO,
             )
 
-        supported_format_folder = split_pdf_folder or supported_folder
-        if not supported_format_folder:
-            print("No Split PDF folder or supported-format folder was found.")
-            return current_folder
+            self.open_folder(driver, wait, unexpected_folder)
+            unexpected_contents = self.get_folders_to_update(driver)
+            record_formats(unexpected_contents)
 
-        print("Opening:", supported_format_folder["title"])
-        self.open_folder(driver, wait, supported_format_folder)
-        contents = self.get_folders_to_update(driver)
+            # Allow one extra level when the unexpected folder contains only one folder.
+            child_folders = [
+                item for item in unexpected_contents if item.get("is_folder")
+            ]
 
-        # If Split PDF was opened, look for and open its Front Matter subfolder.
-        if supported_format_folder is split_pdf_folder:
-            front_matter_folder = next(
-                (
-                    item
-                    for item in contents
-                    if item.get("is_folder")
-                    and "front" in normalized_title(item)
-                    and "matter" in normalized_title(item)
-                ),
-                None,
-            )
-            if front_matter_folder:
-                print("Opening:", front_matter_folder["title"])
-                self.open_folder(driver, wait, front_matter_folder)
+            if len(unexpected_contents) == 1 and len(child_folders) == 1:
+                child_folder = child_folders[0]
+                self.logger.write(
+                    "Opening its single subfolder:",
+                    child_folder.get("title"),
+                    level=logging.INFO,
+                )
+
+                self.open_folder(driver, wait, child_folder)
                 contents = self.get_folders_to_update(driver)
+                record_formats(contents)
 
-        # Search all titles for ISBN-13 first, then ISBN-10.
+                if any(item.get("is_folder") for item in contents):
+                    self.logger.write(
+                        f"Unexpected deeper folder(s) inside "
+                        f"{child_folder['title']!r}. "
+                        f"Contents: {listing(contents)}",
+                        level=logging.WARNING,
+                    )
+                    # TODO: recurse through all folder levels at some point?
+                    return None
+
+                used_unexpected_nesting = True
+
+            elif child_folders:
+                self.logger.write(
+                    f"Unexpected subfolder structure in "
+                    f"{unexpected_folder.get('title')!r}. "
+                    f"Contents: {listing(unexpected_contents)}",
+                    level=logging.WARNING,
+                )
+                # TODO: recurse through all folder levels at some point?
+                return None
+
+            else:
+                # This folder contains files directly, so inspect those files.
+                contents = unexpected_contents
+                record_formats(contents)
+                used_unexpected_nesting = True
+
+        def folder_priority(item):
+            item_formats = formats_in(item)
+            first_format = next(
+                (ext for ext in format_priority if ext in item_formats),
+                "other",
+            )
+            format_rank = (
+                format_priority.index(first_format)
+                if first_format in format_priority
+                else 99
+            )
+            is_split = "split" in normalized_title(item)
+            split_pdf = is_split and "pdf" in item_formats
+            return (
+                (
+                    0
+                    if split_pdf
+                    else 1 if first_format == "pdf" else 2 if is_split else 3
+                ),
+                format_rank,
+            )
+
+        supported_format_folder = None
+
+        if not used_unexpected_nesting:
+            supported_format_folder = (
+                min(format_folders, key=folder_priority) if format_folders else None
+            )
+
+            if supported_format_folder:
+                self.logger.write(
+                    "Opening format folder:", supported_format_folder["title"]
+                )
+                self.open_folder(driver, wait, supported_format_folder)
+                contents = self.get_folders_to_update(driver)
+                record_formats(contents)
+
+                if any(item.get("is_folder") for item in contents):
+                    self.logger.write(
+                        f"Unexpected deeper folder(s) inside "
+                        f"{supported_format_folder['title']!r}. "
+                        f"Contents: {listing(contents)}",
+                        level=logging.WARNING,
+                    )
+                    # TODO: recurse through all folder levels once recursive handling is added.
+                    return None
+
+        # Check PDFs first, then other supported formats; ISBN-13 precedes ISBN-10.
+        search_items = sorted(
+            folders + contents,
+            key=lambda item: (
+                0
+                if format_for(item) == "pdf"
+                else 1 if format_for(item) in supported_extensions else 2
+            ),
+        )
+
         for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
-            for item in contents:
-                isbn = isbn_from_title(item, pattern)
+            for item in search_items:
+                isbn, file_format = isbn_from_title(item, pattern)
                 if isbn:
-                    print(f"ISBN found in title {item['title']!r}:", isbn)
-                    catalog = self.lookup_isbn(isbn)
+                    self.logger.write(
+                        f"Found ISBN in {file_format or 'untyped'} item "
+                        f"{item.get('title')!r}: {isbn}"
+                    )
+                    catalog = self.api.lookup_isbn(isbn)
                     if catalog:
                         return catalog
 
-        # Look for a front-matter file first.
+        if supported_format_folder or used_unexpected_nesting:
+            current_items = contents
+        else:
+            current_items = folders
+            self.logger.write(
+                "No supported-format folder was found; checking the current folder.",
+                level=logging.WARNING,
+            )
+
+        matter_files = [
+            item
+            for item in current_items
+            if not item.get("is_folder")
+            and "matter" in normalized_title(item)
+            and format_for(item) in {"pdf", "tif", "tiff", "docx", "epub"}
+        ]
+        matter_files.sort(
+            key=lambda item: (
+                0
+                if format_for(item) == "pdf"
+                else 1 if format_for(item) in supported_extensions else 2
+            )
+        )
+
         front_matter_file = next(
-            (
-                item
-                for item in contents
-                if not item.get("is_folder")
-                and "front" in normalized_title(item)
-                and "matter" in normalized_title(item)
-            ),
+            (item for item in matter_files if "front" in title_tokens(item)),
             None,
         )
-
-        end_matter_file = None
-        if not front_matter_file:
-            end_matter_file = next(
-                (
-                    item
-                    for item in contents
-                    if not item.get("is_folder")
-                    and (
-                        (
-                            "end" in normalized_title(item)
-                            and "matter" in normalized_title(item)
-                        )
-                        or (
-                            "back" in normalized_title(item)
-                            and "matter" in normalized_title(item)
-                        )
-                    )
-                ),
-                None,
-            )
-
-        matter_file = front_matter_file or end_matter_file
-
-        # If neither was named explicitly, look for any file with "matter".
-        if not matter_file:
-            matter_file = next(
-                (
-                    item
-                    for item in contents
-                    if not item.get("is_folder") and "matter" in normalized_title(item)
-                ),
-                None,
-            )
-
-        if not matter_file:
-            print("No front-matter or end-matter file was found.")
-            return current_folder
-
-        print("Found a possible matter file:", matter_file["title"])
-
-        # Download the file using its row's More Actions menu.
-        downloaded_path = self.download_sharepoint_file(driver, wait, matter_file)
-        print("Downloaded:", downloaded_path)
-
-        title = normalized_title(matter_file)
-        matter_type = (
-            "end"
-            if (
-                ("end" in title and "matter" in title)
-                or ("back" in title and "matter" in title)
-            )
-            else "front"
+        end_matter_file = next(
+            (item for item in matter_files if {"end", "back"} & title_tokens(item)),
+            None,
+        )
+        matter_file = (
+            front_matter_file or end_matter_file or next(iter(matter_files), None)
         )
 
-        isbn = self.find_isbn_in_downloaded_file(downloaded_path, matter_type)
-        if isbn:
-            print("Found ISBN:", isbn)
-            return self.lookup_isbn(isbn)
+        if not matter_file:
+            self.logger.write(
+                f"No front-matter or end-matter file was found. "
+                f"Items: {listing(current_items)}",
+                level=logging.WARNING,
+            )
+            return None
 
-        print("No ISBN found in the selected pages.")
+        self.logger.write("Found a possible matter file:", matter_file["title"])
+        downloaded_path = self.download_sharepoint_file(driver, wait, matter_file)
+        self.logger.write("Downloaded:", downloaded_path)
+
+        matter_tokens = title_tokens(matter_file)
+        if "front" in matter_tokens:
+            matter_type = "front"
+        elif {"end", "back"} & matter_tokens:
+            matter_type = "end"
+        else:
+            matter_type = "front"
+
+        isbn = self.find_isbn_in_downloaded_file(downloaded_path, matter_type)
+
+        if isbn:
+            self.logger.write(
+                f"Found ISBN in downloaded file {matter_file['title']!r}: {isbn}"
+            )
+            return self.api.lookup_isbn(isbn)
+
+        self.logger.write(
+            f"No ISBN found in the downloaded file {matter_file['title']!r}.",
+            level=logging.WARNING,
+        )
         return None
 
     def open_folder(self, driver, wait, folder):
@@ -364,6 +438,10 @@ class TextbookCatalogingService:
                     self.open_folder(driver, wait, item)
                 return item
         print("No folder matches those conditions.")
+        self.logger.write(
+            f"No folder matches the conditions for opening. Folders: {items}",
+            level=logging.WARNING,
+        )
         return None
 
     def click_safely(self, driver, wait, locator):
@@ -570,11 +648,9 @@ class TextbookCatalogingService:
 
         folder["title"] = new_title
 
-        # TODO: is this redundant?
         updated_folder = self.get_folder_by_title(driver, new_title)
         if updated_folder:
             folder.update(updated_folder)
-        # END
 
     def update_folder_formats(self, driver, wait, folder, formats):
         format_names = {
@@ -593,9 +669,45 @@ class TextbookCatalogingService:
         )
         if not selected_formats:
             return
+
         folder = self.get_folder_by_title(driver, folder["title"]) or folder
+        folder_title = folder["title"]
+        original_url = driver.current_url
+        original_signature = self.get_listing_signature(driver)
         format_cell = folder["_elements"]["format"]
-        driver.execute_script("arguments[0].click();", format_cell)
+
+        try:
+            wait.until(EC.element_to_be_clickable(format_cell)).click()
+            WebDriverWait(driver, 2).until(
+                EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
+            )
+        except TimeoutException:
+            if (
+                driver.current_url != original_url
+                or self.get_listing_signature(driver) != original_signature
+            ):
+                raise TimeoutException(
+                    "Clicking the Formats cell changed the listing instead "
+                    "of opening its editor."
+                )
+
+            refreshed_folder = self.get_folder_by_title(driver, folder_title)
+            if not refreshed_folder:
+                raise TimeoutException(
+                    f"Could not find folder {folder_title!r} after selecting "
+                    "the Formats cell."
+                )
+
+            folder.update(refreshed_folder)
+            format_cell = folder["_elements"]["format"]
+            self.logger.write(
+                "Formats cell was selected; clicking it again to open the editor."
+            )
+            wait.until(EC.element_to_be_clickable(format_cell)).click()
+            wait.until(
+                EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
+            )
+
         for format_name in selected_formats:
             callout = wait.until(
                 EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
@@ -604,6 +716,7 @@ class TextbookCatalogingService:
                 By.CSS_SELECTOR, f'[role="option"][title="{format_name}"]'
             )
             driver.execute_script("arguments[0].click();", option)
+
         callout = wait.until(
             EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
         )
@@ -727,6 +840,9 @@ class TextbookCatalogingService:
         if isbn and isbn != folder["title"]:
             self.rename_sharepoint_folder(driver, wait, folder, isbn)
 
+        input("\nPress Enter to continue...")
+
+        # TODO: figure out why formats are not updating
         self.update_folder_formats(driver, wait, folder, folder.get("format") or [])
 
         authors = (
@@ -853,25 +969,32 @@ class TextbookCatalogingService:
         return None
 
     def __init__(self):
-        # Use the Windows Downloads folder.
-        self.download_dir = Path.home() / "Downloads"
-        self.download_dir.mkdir(exist_ok=True)
-
-        options = Options()
-        options.add_experimental_option(
-            "prefs",
-            {
-                "download.default_directory": str(self.download_dir.resolve()),
-                "download.prompt_for_download": False,
-            },
+        self.logger = LogService(
+            Path(__file__).with_name("organize_sharepoint_files.log")
         )
-
-        driver = webdriver.Edge(options=options)
-        wait = WebDriverWait(driver, 10)
-        screen_width = ctypes.windll.user32.GetSystemMetrics(0)
-        screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+        self.api = ApiService(log_service=self.logger)
+        driver = None
 
         try:
+            # Use the Windows Downloads folder.
+            self.download_dir = Path.home() / "Downloads"
+            self.download_dir.mkdir(exist_ok=True)
+
+            options = Options()
+            options.add_experimental_option(
+                "prefs",
+                {
+                    "download.default_directory": str(self.download_dir.resolve()),
+                    "download.prompt_for_download": False,
+                },
+            )
+
+            driver = webdriver.Edge(options=options)
+            wait = WebDriverWait(driver, 10)
+
+            screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+            screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+
             driver.get(self.SHAREPOINT_URL)
             driver.set_window_rect(
                 x=0,
@@ -879,7 +1002,7 @@ class TextbookCatalogingService:
                 width=screen_width,
                 height=screen_height,
             )
-            print("\nEdge opened your SharePoint folder.")
+            self.logger.write("\nEdge opened your SharePoint folder.")
 
             # Load all folders.
             see_more = (
@@ -893,7 +1016,8 @@ class TextbookCatalogingService:
                 book_folder = first_folder
                 result = self.inspect_open_folder(driver, wait, book_folder)
 
-                print("Catalog lookup result:", result)
+                self.logger.write("Catalog lookup result:", result)
+
                 driver.get(self.SHAREPOINT_URL)
                 self.click_safely(driver, wait, see_more)
 
@@ -910,15 +1034,17 @@ class TextbookCatalogingService:
 
             input("\nPress Enter to close Edge...")
 
-        except TimeoutException as exc:
-            print("\nTimed out waiting for SharePoint.")
-            if getattr(exc, "msg", "").strip():
-                print(exc.msg)
-                print("Closing Edge and stopping the script.")
-                return
-
+        except (TimeoutException, TimeoutError) as exc:
+            self.logger.write(
+                f"\nTimed out waiting for SharePoint: {exc}",
+                level=logging.ERROR,
+            )
+            self.logger.write("Closing Edge and stopping the script.")
+        except Exception as exc:
+            self.logger.exception(f"Unexpected error ({type(exc).__name__}): {exc}")
         finally:
-            driver.quit()
+            if driver:
+                driver.quit()
 
 
 if __name__ == "__main__":
