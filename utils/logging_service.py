@@ -10,7 +10,7 @@ class LogService:
         if not self.logger.handlers:
             handler = logging.FileHandler(log_path, encoding="utf-8")
             handler.setFormatter(
-                logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+                logging.Formatter("%(asctime)s %(levelname)s %(message)s\n")
             )
             self.logger.addHandler(handler)
 

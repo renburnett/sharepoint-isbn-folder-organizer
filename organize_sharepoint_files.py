@@ -48,6 +48,7 @@ class TextbookCatalogingService:
     ISBN_13_PATTERN = re.compile(r"(?<!\d)97[89](?:[^\dA-Za-z]?\d){10}(?!\d)")
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
+    MAX_PAGES_TO_SCAN = 8
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -75,7 +76,6 @@ class TextbookCatalogingService:
             "no items found",
             "no files found",
             "no items to show",
-            "drag files here",
         )
         busy_selector = (
             '[aria-busy="true"], [role="progressbar"], '
@@ -94,7 +94,7 @@ class TextbookCatalogingService:
 
             except StaleElementReferenceException:
                 # SharePoint refreshed the page while Selenium was reading it.
-                time.sleep(0.4)
+                time.sleep(0.5)
                 continue
 
             has_results_or_empty_message = bool(signature) or empty
@@ -118,14 +118,14 @@ class TextbookCatalogingService:
                 last_signature = None
                 stable_since = None
 
-            time.sleep(0.4)
+            time.sleep(0.5)
 
         raise TimeoutError("The SharePoint folder listing did not finish loading.")
 
     def inspect_open_folder(self, driver, wait, current_folder):
+        self._detected_formats = []
         supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
         format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
-
         folders = self.get_folders_to_update(driver)
 
         def normalized_title(item):
@@ -141,26 +141,44 @@ class TextbookCatalogingService:
 
         def formats_in(item):
             formats = set()
-            format_text = str(item.get("format") or "").casefold()
-            format_tokens = set(re.findall(r"[a-z0-9]+", format_text))
-            formats.update(format_tokens & supported_extensions)
-
             title = str(item.get("title") or "")
             extension = os.path.splitext(title)[1].casefold().lstrip(".")
             if extension:
                 formats.add(extension if extension in supported_extensions else "other")
-            elif not item.get("is_folder") and format_tokens and not formats:
-                formats.add("other")
 
             title_format_tokens = title_tokens(item)
             formats.update(title_format_tokens & supported_extensions)
             return formats
 
         def record_formats(items):
-            formats = set(current_folder.get("format") or [])
+            formats = set(self._detected_formats)
+            file_extensions = set(current_folder.get("file_extensions") or [])
+            listing_extensions = set()
+
             for item in items:
                 formats.update(formats_in(item))
+                if item.get("is_folder"):
+                    continue
+
+                title = str(item.get("title") or "")
+                extension = os.path.splitext(title)[1].casefold().lstrip(".")
+                if extension:
+                    file_extensions.add(extension)
+                    listing_extensions.add(extension)
+
+            formats.update(file_extensions)
+            current_folder["file_extensions"] = sorted(file_extensions)
             current_folder["format"] = sorted(formats)
+            self._detected_formats = sorted(formats)
+
+            self.logging_service.write(
+                "File extensions in this listing:",
+                sorted(listing_extensions) if listing_extensions else "none",
+            )
+            self.logging_service.write(
+                "All file extensions found so far:",
+                current_folder["file_extensions"],
+            )
 
         def format_for(item):
             formats = formats_in(item)
@@ -179,17 +197,18 @@ class TextbookCatalogingService:
         def isbn_from_title(item, pattern):
             title = str(item.get("title") or "")
             file_format = format_for(item)
-            item["format"] = item.get("format") or file_format
+            item["format"] = file_format
 
             for match in pattern.finditer(title):
                 if self.PHONE_PATTERN.fullmatch(match.group()):
                     continue
+
                 isbn = re.sub(r"[^0-9Xx]", "", match.group()).upper()
                 return isbn, file_format
 
             return None, file_format
 
-        # Record formats from the current folder's files and subfolders.
+        # Record every file in this listing before attempting ISBN lookup.
         record_formats(folders)
 
         format_folders = [
@@ -208,7 +227,7 @@ class TextbookCatalogingService:
 
         if unexpected_folders and not format_folders:
             unexpected_folder = unexpected_folders[0]
-            self.logger.write(
+            self.logging_service.write(
                 "Unexpected subfolder; inspecting its listing:",
                 unexpected_folder.get("title"),
                 level=logging.INFO,
@@ -225,7 +244,7 @@ class TextbookCatalogingService:
 
             if len(unexpected_contents) == 1 and len(child_folders) == 1:
                 child_folder = child_folders[0]
-                self.logger.write(
+                self.logging_service.write(
                     "Opening its single subfolder:",
                     child_folder.get("title"),
                     level=logging.INFO,
@@ -236,25 +255,23 @@ class TextbookCatalogingService:
                 record_formats(contents)
 
                 if any(item.get("is_folder") for item in contents):
-                    self.logger.write(
+                    self.logging_service.write(
                         f"Unexpected deeper folder(s) inside "
                         f"{child_folder['title']!r}. "
                         f"Contents: {listing(contents)}",
                         level=logging.WARNING,
                     )
-                    # TODO: recurse through all folder levels at some point?
                     return None
 
                 used_unexpected_nesting = True
 
             elif child_folders:
-                self.logger.write(
+                self.logging_service.write(
                     f"Unexpected subfolder structure in "
                     f"{unexpected_folder.get('title')!r}. "
                     f"Contents: {listing(unexpected_contents)}",
                     level=logging.WARNING,
                 )
-                # TODO: recurse through all folder levels at some point?
                 return None
 
             else:
@@ -276,6 +293,7 @@ class TextbookCatalogingService:
             )
             is_split = "split" in normalized_title(item)
             split_pdf = is_split and "pdf" in item_formats
+
             return (
                 (
                     0
@@ -293,7 +311,7 @@ class TextbookCatalogingService:
             )
 
             if supported_format_folder:
-                self.logger.write(
+                self.logging_service.write(
                     "Opening format folder:", supported_format_folder["title"]
                 )
                 self.open_folder(driver, wait, supported_format_folder)
@@ -301,16 +319,15 @@ class TextbookCatalogingService:
                 record_formats(contents)
 
                 if any(item.get("is_folder") for item in contents):
-                    self.logger.write(
+                    self.logging_service.write(
                         f"Unexpected deeper folder(s) inside "
                         f"{supported_format_folder['title']!r}. "
                         f"Contents: {listing(contents)}",
                         level=logging.WARNING,
                     )
-                    # TODO: recurse through all folder levels once recursive handling is added.
                     return None
 
-        # Check PDFs first, then other supported formats; ISBN-13 precedes ISBN-10.
+        # Extensions from the opened listings are collected before ISBN lookup.
         search_items = sorted(
             folders + contents,
             key=lambda item: (
@@ -324,11 +341,11 @@ class TextbookCatalogingService:
             for item in search_items:
                 isbn, file_format = isbn_from_title(item, pattern)
                 if isbn:
-                    self.logger.write(
+                    self.logging_service.write(
                         f"Found ISBN in {file_format or 'untyped'} item "
                         f"{item.get('title')!r}: {isbn}"
                     )
-                    catalog = self.api.lookup_isbn(isbn)
+                    catalog = self.api_service.lookup_isbn(isbn)
                     if catalog:
                         return catalog
 
@@ -336,7 +353,7 @@ class TextbookCatalogingService:
             current_items = contents
         else:
             current_items = folders
-            self.logger.write(
+            self.logging_service.write(
                 "No supported-format folder was found; checking the current folder.",
                 level=logging.WARNING,
             )
@@ -365,20 +382,24 @@ class TextbookCatalogingService:
             None,
         )
         matter_file = (
-            front_matter_file or end_matter_file or next(iter(matter_files), None)
+            front_matter_file
+            or end_matter_file
+            or (search_items[0] if search_items else None)
         )
 
         if not matter_file:
-            self.logger.write(
+            self.logging_service.write(
                 f"No front-matter or end-matter file was found. "
                 f"Items: {listing(current_items)}",
                 level=logging.WARNING,
             )
             return None
 
-        self.logger.write("Found a possible matter file:", matter_file["title"])
+        self.logging_service.write(
+            "Found a possible matter file:", matter_file["title"]
+        )
         downloaded_path = self.download_sharepoint_file(driver, wait, matter_file)
-        self.logger.write("Downloaded:", downloaded_path)
+        self.logging_service.write("Downloaded:", downloaded_path)
 
         matter_tokens = title_tokens(matter_file)
         if "front" in matter_tokens:
@@ -389,14 +410,13 @@ class TextbookCatalogingService:
             matter_type = "front"
 
         isbn = self.find_isbn_in_downloaded_file(downloaded_path, matter_type)
-
         if isbn:
-            self.logger.write(
+            self.logging_service.write(
                 f"Found ISBN in downloaded file {matter_file['title']!r}: {isbn}"
             )
-            return self.api.lookup_isbn(isbn)
+            return self.api_service.lookup_isbn(isbn)
 
-        self.logger.write(
+        self.logging_service.write(
             f"No ISBN found in the downloaded file {matter_file['title']!r}.",
             level=logging.WARNING,
         )
@@ -438,7 +458,7 @@ class TextbookCatalogingService:
                     self.open_folder(driver, wait, item)
                 return item
         print("No folder matches those conditions.")
-        self.logger.write(
+        self.logging_service.write(
             f"No folder matches the conditions for opening. Folders: {items}",
             level=logging.WARNING,
         )
@@ -487,7 +507,7 @@ class TextbookCatalogingService:
         rows = driver.find_elements(
             By.CSS_SELECTOR, '[role="row"][data-automationid^="row-"]'
         )
-        print("DOM rows:", len(rows))
+
         items = []
         for row in rows:
             title, title_element = self.read_cell(
@@ -545,7 +565,6 @@ class TextbookCatalogingService:
                     },
                 }
             )
-        print(f"Found {len(items)} item(s).")
         return items
 
     def get_folder_by_title(self, driver, title):
@@ -653,21 +672,20 @@ class TextbookCatalogingService:
             folder.update(updated_folder)
 
     def update_folder_formats(self, driver, wait, folder, formats):
-        format_names = {
-            "pdf": "PDF",
-            "epub": "Epub",
-            "docx": "Docx",
-            "tif": "TIF",
-            "tiff": "TIF",
+        format_aliases = {
+            "pdf": ("PDF",),
+            "epub": ("Epub",),
+            "docx": ("Docx",),
+            "doc": ("Doc", "Word"),
+            "tif": ("TIF",),
+            "tiff": ("TIF",),
         }
-        selected_formats = list(
-            dict.fromkeys(
-                format_names[extension.casefold()]
-                for extension in formats
-                if extension.casefold() in format_names
-            )
-        )
-        if not selected_formats:
+
+        extensions = list(dict.fromkeys(str(ext).casefold() for ext in formats))
+        extensions = [
+            extension for extension in extensions if extension in format_aliases
+        ]
+        if not extensions:
             return
 
         folder = self.get_folder_by_title(driver, folder["title"]) or folder
@@ -700,27 +718,54 @@ class TextbookCatalogingService:
 
             folder.update(refreshed_folder)
             format_cell = folder["_elements"]["format"]
-            self.logger.write(
-                "Formats cell was selected; clicking it again to open the editor."
-            )
             wait.until(EC.element_to_be_clickable(format_cell)).click()
             wait.until(
                 EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
             )
 
-        for format_name in selected_formats:
+        selected_titles = set()
+
+        for extension in extensions:
             callout = wait.until(
                 EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
             )
-            option = callout.find_element(
-                By.CSS_SELECTOR, f'[role="option"][title="{format_name}"]'
+            options = callout.find_elements(By.CSS_SELECTOR, '[role="option"]')
+
+            option = next(
+                (
+                    candidate
+                    for candidate in options
+                    if (candidate.get_attribute("title") or candidate.text)
+                    .strip()
+                    .casefold()
+                    in {alias.casefold() for alias in format_aliases[extension]}
+                ),
+                None,
             )
-            driver.execute_script("arguments[0].click();", option)
+
+            if option is None:
+                self.logging_service.write(
+                    f"No SharePoint Formats choice found for {extension!r}; "
+                    "skipping it.",
+                    level=logging.WARNING,
+                )
+                continue
+
+            option_title = (
+                (option.get_attribute("title") or option.text).strip().casefold()
+            )
+
+            if option_title not in selected_titles:
+                driver.execute_script("arguments[0].click();", option)
+                selected_titles.add(option_title)
 
         callout = wait.until(
             EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
         )
-        save_button = callout.find_element(By.ID, "acceptButtonInCommonEditorCallout")
+        save_button = callout.find_element(
+            By.ID,
+            "acceptButtonInCommonEditorCallout",
+        )
         driver.execute_script("arguments[0].click();", save_button)
         wait.until(EC.invisibility_of_element_located((By.ID, "CommonEditorCalloutId")))
 
@@ -781,10 +826,8 @@ class TextbookCatalogingService:
         wait.until(EC.element_to_be_clickable(cell)).click()
 
         try:
-            # Give the first click a moment to open the editor.
             editor = WebDriverWait(driver, 2).until(find_visible_editor)
         except TimeoutException:
-            # Retry only if the first click left the listing unchanged.
             if (
                 driver.current_url != original_url
                 or self.get_listing_signature(driver) != original_signature
@@ -813,11 +856,47 @@ class TextbookCatalogingService:
         editor.send_keys(str(value))
         editor.send_keys(Keys.ENTER)
 
+        # Tab moves focus out of the editor so SharePoint can commit the value.
+        ActionChains(driver).send_keys(Keys.TAB).perform()
+
         wait.until(
             EC.any_of(
                 EC.staleness_of(editor),
                 EC.invisibility_of_element(editor),
             )
+        )
+
+        expected_value = " ".join(str(value).split()).casefold()
+
+        def field_value_saved(driver):
+            updated_folder = self.get_folder_by_title(driver, folder_title)
+            if not updated_folder:
+                return False
+
+            actual_value = " ".join(
+                str(updated_folder.get(field_name) or "").split()
+            ).casefold()
+
+            if actual_value != expected_value:
+                return False
+
+            folder.update(updated_folder)
+            return True
+
+        try:
+            wait.until(field_value_saved)
+        except TimeoutException as exc:
+            updated_folder = self.get_folder_by_title(driver, folder_title)
+            actual_value = updated_folder.get(field_name) if updated_folder else None
+            raise TimeoutException(
+                f"SharePoint did not confirm saving {field_name!r} "
+                f"for folder {folder_title!r}. Expected {value!r}; "
+                f"found {actual_value!r}."
+            ) from exc
+
+        self.logging_service.write(
+            f"Saved SharePoint {field_name!r} for folder " f"{folder_title!r}: ",
+            value,
         )
 
     def update_folder_from_catalog(self, driver, wait, folder, catalog):
@@ -833,40 +912,193 @@ class TextbookCatalogingService:
             or catalog.get("full_title")
             or catalog.get("short_title")
         )
+        subtitle = str(catalog.get("subtitle") or "").strip()
+
+        if title:
+            title = str(title).strip()
+            if subtitle and subtitle.casefold() not in title.casefold():
+                title = f"{title}: {subtitle}"
 
         print("isbn", isbn)
         print("title", title)
 
+        self._catalog_log_context = {
+            "isbn": isbn or str(folder.get("title") or ""),
+            "catalog_title": title,
+            "folder_details": {
+                key: folder.get(key)
+                for key in (
+                    "title",
+                    "modified_by",
+                    "format",
+                    "book_title",
+                    "author",
+                    "publisher",
+                    "edition",
+                    "is_folder",
+                )
+            },
+        }
+
         if isbn and isbn != folder["title"]:
             self.rename_sharepoint_folder(driver, wait, folder, isbn)
 
-        input("\nPress Enter to continue...")
-
-        # TODO: figure out why formats are not updating
-        self.update_folder_formats(driver, wait, folder, folder.get("format") or [])
-
-        authors = (
-            catalog.get("by_statement")
-            or catalog.get("authors")
-            or catalog.get("contributions")
+        formats_to_apply = folder.get("format") or folder.get("file_extensions") or []
+        self.logging_service.write(
+            f"Applying detected formats for ISBN {isbn or folder['title']!r}: ",
+            formats_to_apply,
+        )
+        self.update_folder_formats(
+            driver,
+            wait,
+            folder,
+            formats_to_apply,
         )
 
-        if isinstance(authors, list):
-            authors = "; ".join(
-                author.get("name", "") if isinstance(author, dict) else str(author)
-                for author in authors
-            )
+        author_entries = catalog.get("authors") or []
+        if not isinstance(author_entries, (list, tuple)):
+            author_entries = [author_entries]
+
+        author_names = []
+        seen_names = set()
+
+        # Limit author lookups to the first four author entries.
+        for author in author_entries[:4]:
+            name = None
+
+            if isinstance(author, dict):
+                name = author.get("name") or author.get("personal_name")
+
+                if not name and author.get("key"):
+                    author_record = self.api_service.lookup_author(author["key"])
+                    if author_record:
+                        name = author_record.get("name") or author_record.get(
+                            "personal_name"
+                        )
+            elif author is not None:
+                name = str(author)
+
+            name = str(name or "").strip()
+            if not name:
+                continue
+
+            dedupe_key = name.casefold()
+            if dedupe_key not in seen_names:
+                seen_names.add(dedupe_key)
+                author_names.append(name)
+
+        if author_names:
+            authors = "; ".join(author_names)
+        else:
+            # Use by_statement only when the author records did not provide names.
+            authors = catalog.get("by_statement")
+            if not authors:
+                authors = catalog.get("contributions")
+
+            if isinstance(authors, (list, tuple)):
+                authors = "; ".join(
+                    str(author).strip() for author in authors if str(author).strip()
+                )
+
+            authors = str(authors).strip() if authors else None
 
         publishers = catalog.get("publishers") or catalog.get("publisher")
-        if isinstance(publishers, list):
-            publishers = "; ".join(map(str, publishers))
+        if isinstance(publishers, (list, tuple)):
+            publishers = "; ".join(
+                str(publisher).strip()
+                for publisher in publishers
+                if str(publisher).strip()
+            )
+
+        edition = catalog.get("edition_name")
+
+        if not edition:
+            notes = catalog.get("notes")
+            if isinstance(notes, dict):
+                notes = notes.get("value", "")
+
+            edition_text = " ".join(
+                str(value or "")
+                for value in (
+                    notes,
+                    catalog.get("title"),
+                    catalog.get("full_title"),
+                    catalog.get("subtitle"),
+                )
+            )
+
+            match = re.search(
+                r"\b\d+(?:st|nd|rd|th)\s+edition\b",
+                edition_text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                edition = match.group(0)
 
         self.update_folder_text_field(driver, wait, folder, "book_title", title)
         self.update_folder_text_field(driver, wait, folder, "author", authors)
         self.update_folder_text_field(driver, wait, folder, "publisher", publishers)
-        self.update_folder_text_field(
-            driver, wait, folder, "edition", catalog.get("edition_name")
+        self.update_folder_text_field(driver, wait, folder, "edition", edition)
+
+        updated_folder = self.get_folder_by_title(driver, folder["title"])
+        if updated_folder:
+            folder.update(updated_folder)
+
+        details = {
+            key: folder.get(key)
+            for key in (
+                "title",
+                "modified_by",
+                "format",
+                "book_title",
+                "author",
+                "publisher",
+                "edition",
+                "is_folder",
+            )
+        }
+        context = {
+            "isbn": isbn or str(folder.get("title") or ""),
+            "catalog_title": title,
+            "folder_details": details,
+        }
+        self._catalog_log_context = context
+
+        def is_missing(value):
+            if value is None:
+                return True
+            if isinstance(value, (list, tuple, set, dict)):
+                return not value
+            return not str(value).strip()
+
+        required_fields = (
+            ("Book Title", "book_title"),
+            ("Author(s)", "author"),
+            ("Format(s)", "format"),
         )
+        optional_fields = (("Publisher", "publisher"),)
+
+        for label, field_name in required_fields:
+            if is_missing(folder.get(field_name)):
+                self.logging_service.write(
+                    f"Required SharePoint cell {label!r} is missing. "
+                    f"ISBN: {context['isbn']!r}; "
+                    f"catalog title: {context['catalog_title']!r}; "
+                    f"details: {details!r}",
+                    level=logging.ERROR,
+                )
+
+        for label, field_name in optional_fields:
+            if is_missing(folder.get(field_name)):
+                self.logging_service.write(
+                    f"Optional SharePoint cell {label!r} is missing. "
+                    f"ISBN: {context['isbn']!r}; "
+                    f"catalog title: {context['catalog_title']!r}; "
+                    f"details: {details!r}",
+                    level=logging.WARNING,
+                )
+
+        self._catalog_log_context = None
 
     def download_sharepoint_file(self, driver, wait, item):
         before = set(self.download_dir.iterdir())
@@ -914,65 +1146,118 @@ class TextbookCatalogingService:
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
         extension = file_path.suffix.casefold()
+        max_pages_to_scan = getattr(self, "MAX_PAGES_TO_SCAN", 8)
         text_parts = []
+
         if extension == ".pdf":
             reader = PdfReader(str(file_path))
             pdf_for_ocr = pymupdf.open(str(file_path))
+
             if matter_type == "end":
-                start = max(0, len(reader.pages) - 8)
+                start = max(0, len(reader.pages) - max_pages_to_scan)
                 page_numbers = range(start, len(reader.pages))
             else:
-                page_numbers = range(min(8, len(reader.pages)))
+                page_numbers = range(min(max_pages_to_scan, len(reader.pages)))
+
             for page_number in page_numbers:
                 text = reader.pages[page_number].extract_text() or ""
-                # OCR the page if it has no extractable text.
                 if not text.strip():
                     pixmap = pdf_for_ocr[page_number].get_pixmap(dpi=200)
                     image = Image.frombytes(
-                        "RGB", (pixmap.width, pixmap.height), pixmap.samples
+                        "RGB",
+                        (pixmap.width, pixmap.height),
+                        pixmap.samples,
                     )
                     text = pytesseract.image_to_string(image)
+
                 text_parts.append(text)
+
         elif extension in {".tif", ".tiff"}:
             with Image.open(file_path) as image:
                 frame_count = getattr(image, "n_frames", 1)
+
                 if matter_type == "end":
-                    start = max(0, frame_count - 8)
+                    start = max(0, frame_count - max_pages_to_scan)
                     frame_numbers = range(start, frame_count)
                 else:
-                    frame_numbers = range(min(8, frame_count))
+                    frame_numbers = range(min(max_pages_to_scan, frame_count))
+
                 for frame_number in frame_numbers:
                     image.seek(frame_number)
                     text_parts.append(pytesseract.image_to_string(image.copy()))
+
+        elif extension in {".jpg", ".jpeg"}:
+            with Image.open(file_path) as image:
+                text_parts.append(pytesseract.image_to_string(image.convert("RGB")))
+
         elif extension == ".docx":
             document = Document(str(file_path))
             text_parts.extend(paragraph.text for paragraph in document.paragraphs)
             for table in document.tables:
                 for row in table.rows:
                     text_parts.append(" ".join(cell.text for cell in row.cells))
+
+        elif extension == ".doc":
+            try:
+                import win32com.client
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Reading .doc files requires pywin32. Install it with: "
+                    "python -m pip install pywin32"
+                ) from exc
+
+            word = None
+            document = None
+            try:
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                document = word.Documents.Open(
+                    FileName=str(Path(file_path).resolve()),
+                    ConfirmConversions=False,
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    NoEncodingDialog=True,
+                )
+                text_parts.append(document.Content.Text)
+            finally:
+                if document is not None:
+                    try:
+                        document.Close(SaveChanges=False)
+                    except Exception:
+                        pass
+
+                if word is not None:
+                    try:
+                        word.Quit(SaveChanges=False)
+                    except Exception:
+                        pass
+
         elif extension == ".epub":
             book = epub.read_epub(str(file_path))
             for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
                 soup = BeautifulSoup(item.get_content(), "html.parser")
                 text_parts.append(soup.get_text(" ", strip=True))
+
         else:
             raise ValueError(f"Unsupported file type: {extension}")
+
         text = "\n".join(text_parts)
 
-        # Search for ISBN-13 across the text before trying ISBN-10.
         for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
             for match in pattern.finditer(text):
                 if self.PHONE_PATTERN.fullmatch(match.group()):
                     continue
+
                 return re.sub(r"[^0-9Xx]", "", match.group()).upper()
 
         return None
 
     def __init__(self):
-        self.logger = LogService(
-            Path(__file__).with_name("organize_sharepoint_files.log")
+        self.logging_service = LogService(
+            Path(__file__).with_name("textbook_cataloging.log")
         )
-        self.api = ApiService(log_service=self.logger)
+        self.api_service = ApiService(logging_service=self.logging_service)
         driver = None
 
         try:
@@ -1002,7 +1287,7 @@ class TextbookCatalogingService:
                 width=screen_width,
                 height=screen_height,
             )
-            self.logger.write("\nEdge opened your SharePoint folder.")
+            self.logging_service.write("\nEdge opened SharePoint folder.")
 
             # Load all folders.
             see_more = (
@@ -1016,12 +1301,20 @@ class TextbookCatalogingService:
                 book_folder = first_folder
                 result = self.inspect_open_folder(driver, wait, book_folder)
 
-                self.logger.write("Catalog lookup result:", result)
+                detected_formats = list(
+                    getattr(self, "_detected_formats", [])
+                    or book_folder.get("file_extensions")
+                    or book_folder.get("format")
+                    or []
+                )
+                self.logging_service.write(
+                    "Detected formats to carry back to the parent folder:",
+                    detected_formats,
+                )
+                self.logging_service.write("Catalog lookup result:", result)
 
                 driver.get(self.SHAREPOINT_URL)
                 self.click_safely(driver, wait, see_more)
-
-                detected_formats = book_folder.get("format") or []
                 first_folder = self.open_first_eligible_folder(driver, wait, False)
 
                 if (
@@ -1030,18 +1323,40 @@ class TextbookCatalogingService:
                     and str(result.get("key", "")).startswith("/books/")
                 ):
                     first_folder["format"] = detected_formats
+                    first_folder["file_extensions"] = list(
+                        book_folder.get("file_extensions") or []
+                    )
                     self.update_folder_from_catalog(driver, wait, first_folder, result)
 
             input("\nPress Enter to close Edge...")
 
         except (TimeoutException, TimeoutError) as exc:
-            self.logger.write(
+            catalog_context = getattr(self, "_catalog_log_context", None)
+            if catalog_context:
+                self.logging_service.write(
+                    f"SharePoint processing timed out; ISBN, title, and folder "
+                    f"details: {catalog_context!r}",
+                    level=logging.ERROR,
+                )
+            self.logging_service.write(
                 f"\nTimed out waiting for SharePoint: {exc}",
                 level=logging.ERROR,
             )
-            self.logger.write("Closing Edge and stopping the script.")
+            self.logging_service.write("Closing Edge and stopping the script.")
+            input("\nPress Enter to continue...")
+
         except Exception as exc:
-            self.logger.exception(f"Unexpected error ({type(exc).__name__}): {exc}")
+            catalog_context = getattr(self, "_catalog_log_context", None)
+            if catalog_context:
+                self.logging_service.write(
+                    f"Catalog update failed; ISBN, title, and folder details: "
+                    f"{catalog_context!r}",
+                    level=logging.ERROR,
+                )
+            self.logging_service.exception(
+                f"Unexpected error ({type(exc).__name__}): {exc}"
+            )
+
         finally:
             if driver:
                 driver.quit()
