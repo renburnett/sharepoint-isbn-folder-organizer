@@ -1327,6 +1327,7 @@ class TextbookCatalogingService:
                         book_folder.get("file_extensions") or []
                     )
                     self.update_folder_from_catalog(driver, wait, first_folder, result)
+                    # TODO: MAKE SURE NEW CELL UPDATES GET SAVED!!!!!!! REN
 
             input("\nPress Enter to close Edge...")
 
