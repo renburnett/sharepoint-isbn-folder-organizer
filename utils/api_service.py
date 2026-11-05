@@ -84,7 +84,9 @@ class ApiService:
                 return response.json()
 
             except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response else None
+                status_code = (
+                    exc.response.status_code if exc.response is not None else None
+                )
                 retryable = status_code == 429 or (
                     status_code is not None and status_code >= 500
                 )

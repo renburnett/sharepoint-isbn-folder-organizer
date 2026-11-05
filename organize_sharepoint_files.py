@@ -2,14 +2,15 @@ from utils.logging_service import LogService
 from utils.api_service import ApiService
 from config import SID
 import time
+from datetime import datetime
 import ctypes
 import os
 import re
 from pathlib import Path
 import ebooklib
 import pymupdf
-import pytesseract
 import logging
+import pytesseract
 
 pytesseract.pytesseract.tesseract_cmd = (
     rf"C:\Users\{SID}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
@@ -540,8 +541,11 @@ class TextbookCatalogingService:
         wait.until(EC.any_of(EC.staleness_of(old_row), EC.url_changes(old_url)))
         self.wait_for_folder_listing(driver, previous_signature=old_signature)
 
-    def open_first_eligible_folder(self, driver, wait, open_subfolders=True):
+    def open_first_eligible_folder(
+        self, driver, wait, open_subfolders=True, excluded_titles=None
+    ):
         self.wait_for_folder_listing(driver)
+
         wait.until(
             lambda d: len(
                 d.find_elements(
@@ -550,16 +554,21 @@ class TextbookCatalogingService:
             )
             > self.MINIMUM_ROWS_TO_LOAD
         )
+
         items = self.get_folders_to_update(driver)
         excluded_names = ("abueg", "izaiah", "burnett", "-sa")
+        excluded_titles = {str(title).casefold() for title in (excluded_titles or ())}
 
         for item in items:
             modified_by = (item.get("modified_by") or "").casefold()
             formats = (item.get("format") or "").strip()
             book_title = (item.get("book_title") or "").strip()
+            title = str(item.get("title") or "")
             excluded = any(name in modified_by for name in excluded_names)
+
             if (
                 item.get("is_folder")
+                and title.casefold() not in excluded_titles
                 and not excluded
                 and not formats
                 and not book_title
@@ -567,6 +576,7 @@ class TextbookCatalogingService:
                 if open_subfolders:
                     self.open_folder(driver, wait, item)
                 return item
+
         print("No folder matches those conditions.")
         self.logging_service.write(
             f"No folder matches the conditions for opening. Folders: {items}",
@@ -1425,11 +1435,13 @@ class TextbookCatalogingService:
         return None
 
     def __init__(self):
-        self.logging_service = LogService(
-            Path(__file__).with_name("textbook_cataloging.log")
-        )
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        log_path = Path(__file__).with_name(f"textbook_cataloging_{run_timestamp}.log")
+        self.logging_service = LogService(log_path)
         self.api_service = ApiService(logging_service=self.logging_service)
+        self.skipped_folder_renames = 0
         driver = None
+        processed_titles = set()
 
         def valid_google_books_result(result):
             if (
@@ -1513,10 +1525,23 @@ class TextbookCatalogingService:
                 'div[role="gridcell"][class*="seeMoreCell"] button',
             )
             self.click_safely(driver, wait, see_more)
-            first_folder = self.open_first_eligible_folder(driver, wait)
 
-            if first_folder:
-                book_folder = first_folder
+            for attempt in range(1, self.MAX_FOLDERS_TO_RENAME + 1):
+                self.logging_service.write(
+                    f"Starting folder pass {attempt} of "
+                    f"{self.MAX_FOLDERS_TO_RENAME}."
+                )
+
+                book_folder = self.open_first_eligible_folder(
+                    driver,
+                    wait,
+                    excluded_titles=processed_titles,
+                )
+                if not book_folder:
+                    self.logging_service.write("No more eligible folders to process.")
+                    break
+
+                processed_titles.add(str(book_folder.get("title") or "").casefold())
                 result = self.inspect_open_folder(driver, wait, book_folder)
 
                 detected_formats = list(
@@ -1533,7 +1558,17 @@ class TextbookCatalogingService:
 
                 driver.get(self.SHAREPOINT_URL)
                 self.click_safely(driver, wait, see_more)
-                first_folder = self.open_first_eligible_folder(driver, wait, False)
+                self.wait_for_folder_listing(driver)
+                wait.until(
+                    lambda d: len(
+                        d.find_elements(
+                            By.CSS_SELECTOR,
+                            '[role="row"][data-automationid^="row-"]',
+                        )
+                    )
+                    > self.MINIMUM_ROWS_TO_LOAD
+                )
+                parent_folder = self.get_folder_by_title(driver, book_folder["title"])
 
                 open_library_result = isinstance(result, dict) and str(
                     result.get("key", "")
@@ -1543,15 +1578,28 @@ class TextbookCatalogingService:
                     and valid_google_books_result(result)
                 )
 
-                if first_folder and (open_library_result or google_books_result):
-                    first_folder["format"] = detected_formats
-                    first_folder["file_extensions"] = list(
+                if parent_folder and (open_library_result or google_books_result):
+                    parent_folder["format"] = detected_formats
+                    parent_folder["file_extensions"] = list(
                         book_folder.get("file_extensions") or []
                     )
-                    self.update_folder_from_catalog(driver, wait, first_folder, result)
+                    original_title = parent_folder.get("title")
+
+                    self.update_folder_from_catalog(driver, wait, parent_folder, result)
                     # TODO: MAKE SURE NEW CELL UPDATES GET SAVED!!!!!!! REN
 
-            input("\nPress Enter to close Edge...")
+                    if parent_folder.get("title") == original_title:
+                        self.skipped_folder_renames += 1
+                        self.logging_service.write(
+                            f"Folder rename skipped for {original_title!r}."
+                        )
+                else:
+                    self.skipped_folder_renames += 1
+                    self.logging_service.write(
+                        f"Folder rename skipped for "
+                        f"{book_folder.get('title')!r}: no eligible catalog "
+                        f"result or parent folder row."
+                    )
 
         except (TimeoutException, TimeoutError) as exc:
             catalog_context = getattr(self, "_catalog_log_context", None)
@@ -1581,7 +1629,11 @@ class TextbookCatalogingService:
             )
 
         finally:
+            self.logging_service.write(
+                f"Total folder renames skipped: {self.skipped_folder_renames}"
+            )
             if driver:
+                input("\nPress Enter to close Edge and finish the script...")
                 driver.quit()
 
 
