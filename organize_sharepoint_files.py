@@ -49,6 +49,7 @@ class TextbookCatalogingService:
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
     MAX_PAGES_TO_SCAN = 8
+    MAX_FOLDERS_TO_RENAME = 3
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -129,6 +130,16 @@ class TextbookCatalogingService:
 
         supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
         format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
+        scannable_extensions = {
+            ".pdf",
+            ".tif",
+            ".tiff",
+            ".jpg",
+            ".jpeg",
+            ".docx",
+            ".doc",
+            ".epub",
+        }
         folders = self.get_folders_to_update(driver)
 
         def normalized_title(item):
@@ -145,12 +156,18 @@ class TextbookCatalogingService:
         def edition_from_text(text):
             match = re.search(
                 r"(?<![A-Za-z0-9])"
-                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?:(?P<shorthand>\d{1,2}\s*e)|"
+                r"(?P<ordinal>\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"[\s-]+(?:edition|ed\.?))"
                 r"(?![A-Za-z0-9])",
                 str(text or ""),
                 flags=re.IGNORECASE,
             )
-            return re.sub(r"[\s-]+", "", match.group(1)).casefold() if match else None
+            if not match:
+                return None
+
+            edition = match.group("shorthand") or match.group("ordinal")
+            return re.sub(r"[\s-]+", "", edition).casefold()
 
         def record_editions(items):
             if self._detected_edition:
@@ -176,12 +193,10 @@ class TextbookCatalogingService:
 
             extension = os.path.splitext(title)[1].casefold().lstrip(".")
 
-            # For files, trust the actual extension when it is supported.
             if extension in supported_extensions:
                 formats.add(extension)
                 return formats
 
-            # If the extension is missing or unsupported, use the Formats field.
             format_text = str(item.get("format") or "").casefold()
             formats.update(
                 token
@@ -268,6 +283,13 @@ class TextbookCatalogingService:
 
             return catalog
 
+        def is_scannable_file(item):
+            if item.get("is_folder"):
+                return False
+
+            extension = os.path.splitext(str(item.get("title") or ""))[1].casefold()
+            return extension in scannable_extensions
+
         record_editions([current_folder])
         record_formats(folders)
 
@@ -297,7 +319,6 @@ class TextbookCatalogingService:
             unexpected_contents = self.get_folders_to_update(driver)
             record_formats(unexpected_contents)
 
-            # Allow one extra level when the unexpected folder contains only one folder.
             child_folders = [
                 item for item in unexpected_contents if item.get("is_folder")
             ]
@@ -335,7 +356,6 @@ class TextbookCatalogingService:
                 return None
 
             else:
-                # This folder contains files directly, so inspect those files.
                 contents = unexpected_contents
                 record_formats(contents)
                 used_unexpected_nesting = True
@@ -408,7 +428,6 @@ class TextbookCatalogingService:
             if isbn and isbn not in isbn_10_candidates:
                 isbn_10_candidates.append(isbn)
 
-        # If a title already contains ISBN-13, use that one lookup and stop.
         if isbn_13_candidates:
             isbn = isbn_13_candidates[0]
             self.logging_service.write(f"Found ISBN-13 in item titles: {isbn}")
@@ -426,15 +445,16 @@ class TextbookCatalogingService:
         matter_files = [
             item
             for item in current_items
-            if not item.get("is_folder")
-            and "matter" in normalized_title(item)
-            and format_for(item) in {"pdf", "tif", "tiff", "docx", "epub"}
+            if is_scannable_file(item) and "matter" in normalized_title(item)
         ]
         matter_files.sort(
             key=lambda item: (
-                0
-                if format_for(item) == "pdf"
-                else 1 if format_for(item) in supported_extensions else 2
+                0 if format_for(item) == "pdf" else 1,
+                (
+                    format_priority.index(format_for(item))
+                    if format_for(item) in format_priority
+                    else 99
+                ),
             )
         )
 
@@ -446,11 +466,13 @@ class TextbookCatalogingService:
             (item for item in matter_files if {"end", "back"} & title_tokens(item)),
             None,
         )
-        matter_file = (
-            front_matter_file
-            or end_matter_file
-            or (search_items[0] if search_items else None)
-        )
+
+        matter_file = front_matter_file or end_matter_file
+        if matter_file is None:
+            scannable_files = [
+                item for item in current_items if is_scannable_file(item)
+            ]
+            matter_file = scannable_files[0] if scannable_files else None
 
         if not matter_file:
             if isbn_10_candidates:
@@ -460,7 +482,6 @@ class TextbookCatalogingService:
                 )
                 return lookup_catalog(isbn)
 
-            # TODO: CHECK on GOOGLE API for ISBN-13.
             self.logging_service.write(
                 "No ISBN-13 or ISBN-10 was found. "
                 "TODO: CHECK on GOOGLE API for ISBN-13.",
@@ -502,7 +523,6 @@ class TextbookCatalogingService:
                 f"Found ISBN-10 in downloaded file {matter_file['title']!r}: {isbn}"
             )
         else:
-            # TODO: CHECK on GOOGLE API for ISBN-13.
             self.logging_service.write(
                 f"No ISBN-13 or ISBN-10 was found in the downloaded file "
                 f"{matter_file['title']!r}. TODO: CHECK on GOOGLE API for ISBN-13.",
@@ -991,6 +1011,14 @@ class TextbookCatalogingService:
 
     def update_folder_from_catalog(self, driver, wait, folder, catalog):
         isbn_13_value = catalog.get("isbn_13")
+
+        if not isbn_13_value:
+            isbn_13_value = [
+                identifier.get("identifier")
+                for identifier in catalog.get("industryIdentifiers", [])
+                if isinstance(identifier, dict) and identifier.get("type") == "ISBN_13"
+            ]
+
         if not isinstance(isbn_13_value, (list, tuple)):
             isbn_13_value = [isbn_13_value]
 
@@ -1004,7 +1032,6 @@ class TextbookCatalogingService:
         selected_isbn = str(getattr(self, "_selected_isbn", "") or "")
         selected_isbn = re.sub(r"[^0-9Xx]", "", selected_isbn).upper()
 
-        # A directly found ISBN-13 is still usable if the API record omits its ISBN-13 field.
         if (
             not isbn
             and len(selected_isbn) == 13
@@ -1015,7 +1042,7 @@ class TextbookCatalogingService:
         if not isbn:
             # TODO: CHECK on GOOGLE API for ISBN-13.
             self.logging_service.write(
-                f"Open Library returned no ISBN-13 for ISBN {selected_isbn!r}; "
+                f"Catalog result returned no ISBN-13 for ISBN {selected_isbn!r}; "
                 "stopping before renaming or updating the folder. "
                 "TODO: CHECK on GOOGLE API for ISBN-13.",
                 level=logging.ERROR,
@@ -1106,7 +1133,6 @@ class TextbookCatalogingService:
         if author_names:
             authors = "; ".join(author_names)
         else:
-            # Use by_statement only when the author records did not provide names.
             authors = catalog.get("by_statement")
             if not authors:
                 authors = catalog.get("contributions")
@@ -1126,8 +1152,11 @@ class TextbookCatalogingService:
                 if str(publisher).strip()
             )
 
-        edition = getattr(self, "_detected_edition", None) or catalog.get(
-            "edition_name"
+        # Keep a valid title-derived edition ahead of catalog metadata.
+        edition = (
+            getattr(self, "_detected_edition", None)
+            or catalog.get("edition_name")
+            or catalog.get("edition")
         )
 
         if not edition:
@@ -1147,13 +1176,16 @@ class TextbookCatalogingService:
 
             match = re.search(
                 r"(?<![A-Za-z0-9])"
-                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?:(?P<shorthand>\d{1,2}\s*e)|"
+                r"(?P<ordinal>\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"[\s-]+(?:edition|ed\.?))"
                 r"(?![A-Za-z0-9])",
                 edition_text,
                 flags=re.IGNORECASE,
             )
             if match:
-                edition = re.sub(r"[\s-]+", "", match.group(1)).casefold()
+                edition_marker = match.group("shorthand") or match.group("ordinal")
+                edition = re.sub(r"[\s-]+", "", edition_marker).casefold()
 
         self.update_folder_text_field(driver, wait, folder, "book_title", title)
         self.update_folder_text_field(driver, wait, folder, "author", authors)
@@ -1364,19 +1396,20 @@ class TextbookCatalogingService:
 
         text = "\n".join(text_parts)
 
-        # Use text from the downloaded file only when no title contained an edition.
+        # Prefer title-derived editions; only scan downloaded text when none was found.
         if not getattr(self, "_detected_edition", None):
             match = re.search(
                 r"(?<![A-Za-z0-9])"
-                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?:(?P<shorthand>\d{1,2}\s*e)|"
+                r"(?P<ordinal>\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"[\s-]+(?:edition|ed\.?))"
                 r"(?![A-Za-z0-9])",
                 text,
                 flags=re.IGNORECASE,
             )
             if match:
-                self._detected_edition = re.sub(
-                    r"[\s-]+", "", match.group(1)
-                ).casefold()
+                edition = match.group("shorthand") or match.group("ordinal")
+                self._detected_edition = re.sub(r"[\s-]+", "", edition).casefold()
                 self.logging_service.write(
                     f"Found edition marker in downloaded text: "
                     f"{self._detected_edition}"
@@ -1398,8 +1431,56 @@ class TextbookCatalogingService:
         self.api_service = ApiService(logging_service=self.logging_service)
         driver = None
 
+        def valid_google_books_result(result):
+            if (
+                not isinstance(result, dict)
+                or not str(result.get("title") or "").strip()
+            ):
+                return False
+
+            identifiers = result.get("industryIdentifiers")
+            if not isinstance(identifiers, (list, tuple)):
+                return False
+
+            for item in identifiers:
+                if not isinstance(item, dict):
+                    continue
+
+                identifier_type = item.get("type")
+                identifier = re.sub(
+                    r"[^0-9Xx]", "", str(item.get("identifier") or "")
+                ).upper()
+
+                if identifier_type == "ISBN_13":
+                    if (
+                        len(identifier) == 13
+                        and identifier.startswith(("978", "979"))
+                        and identifier.isdigit()
+                    ):
+                        checksum = sum(
+                            int(digit) * (1 if index % 2 == 0 else 3)
+                            for index, digit in enumerate(identifier[:12])
+                        )
+                        if (10 - checksum % 10) % 10 == int(identifier[-1]):
+                            return True
+
+                elif identifier_type == "ISBN_10":
+                    if (
+                        len(identifier) == 10
+                        and identifier[:9].isdigit()
+                        and re.fullmatch(r"\d{9}[\dX]", identifier)
+                    ):
+                        checksum = sum(
+                            (10 - index) * int(digit)
+                            for index, digit in enumerate(identifier[:9])
+                        )
+                        checksum += 10 if identifier[-1] == "X" else int(identifier[-1])
+                        if checksum % 11 == 0:
+                            return True
+
+            return False
+
         try:
-            # Use the Windows Downloads folder.
             self.download_dir = Path.home() / "Downloads"
             self.download_dir.mkdir(exist_ok=True)
 
@@ -1427,7 +1508,6 @@ class TextbookCatalogingService:
             )
             self.logging_service.write("\nEdge opened SharePoint folder.")
 
-            # Load all folders.
             see_more = (
                 By.CSS_SELECTOR,
                 'div[role="gridcell"][class*="seeMoreCell"] button',
@@ -1455,11 +1535,15 @@ class TextbookCatalogingService:
                 self.click_safely(driver, wait, see_more)
                 first_folder = self.open_first_eligible_folder(driver, wait, False)
 
-                if (
-                    first_folder
-                    and result
-                    and str(result.get("key", "")).startswith("/books/")
-                ):
+                open_library_result = isinstance(result, dict) and str(
+                    result.get("key", "")
+                ).startswith("/books/")
+                google_books_result = (
+                    self.api_service.GOOGLE_BOOKS_FALLBACK_ENABLED
+                    and valid_google_books_result(result)
+                )
+
+                if first_folder and (open_library_result or google_books_result):
                     first_folder["format"] = detected_formats
                     first_folder["file_extensions"] = list(
                         book_folder.get("file_extensions") or []
