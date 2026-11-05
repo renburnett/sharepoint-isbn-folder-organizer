@@ -125,6 +125,7 @@ class TextbookCatalogingService:
     def inspect_open_folder(self, driver, wait, current_folder):
         self._detected_formats = []
         self._detected_edition = None
+        self._selected_isbn = None
 
         supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
         format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
@@ -237,7 +238,20 @@ class TextbookCatalogingService:
 
             return None, file_format
 
-        # Include the current folder name, then record the first listing.
+        def lookup_catalog(isbn):
+            self._selected_isbn = isbn
+            catalog = self.api_service.lookup_isbn(isbn)
+
+            if not catalog:
+                # TODO: CHECK on GOOGLE API for ISBN-13.
+                self.logging_service.write(
+                    f"Open Library did not return a record for ISBN {isbn}. "
+                    "TODO: CHECK on GOOGLE API for ISBN-13.",
+                    level=logging.WARNING,
+                )
+
+            return catalog
+
         record_editions([current_folder])
         record_formats(folders)
 
@@ -357,7 +371,6 @@ class TextbookCatalogingService:
                     )
                     return None
 
-        # Extensions from the opened listings are collected before ISBN lookup.
         search_items = sorted(
             folders + contents,
             key=lambda item: (
@@ -367,17 +380,23 @@ class TextbookCatalogingService:
             ),
         )
 
-        for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
-            for item in search_items:
-                isbn, file_format = isbn_from_title(item, pattern)
-                if isbn:
-                    self.logging_service.write(
-                        f"Found ISBN in {file_format or 'untyped'} item "
-                        f"{item.get('title')!r}: {isbn}"
-                    )
-                    catalog = self.api_service.lookup_isbn(isbn)
-                    if catalog:
-                        return catalog
+        isbn_13_candidates = []
+        isbn_10_candidates = []
+
+        for item in search_items:
+            isbn, file_format = isbn_from_title(item, self.ISBN_13_PATTERN)
+            if isbn and isbn not in isbn_13_candidates:
+                isbn_13_candidates.append(isbn)
+
+            isbn, file_format = isbn_from_title(item, self.ISBN_10_PATTERN)
+            if isbn and isbn not in isbn_10_candidates:
+                isbn_10_candidates.append(isbn)
+
+        # If a title already contains ISBN-13, use that one lookup and stop.
+        if isbn_13_candidates:
+            isbn = isbn_13_candidates[0]
+            self.logging_service.write(f"Found ISBN-13 in item titles: {isbn}")
+            return lookup_catalog(isbn)
 
         if supported_format_folder or used_unexpected_nesting:
             current_items = contents
@@ -418,9 +437,17 @@ class TextbookCatalogingService:
         )
 
         if not matter_file:
+            if isbn_10_candidates:
+                isbn = isbn_10_candidates[0]
+                self.logging_service.write(
+                    f"Only ISBN-10 was found in item titles; looking it up: {isbn}"
+                )
+                return lookup_catalog(isbn)
+
+            # TODO: CHECK on GOOGLE API for ISBN-13.
             self.logging_service.write(
-                f"No front-matter or end-matter file was found. "
-                f"Items: {listing(current_items)}",
+                "No ISBN-13 or ISBN-10 was found. "
+                "TODO: CHECK on GOOGLE API for ISBN-13.",
                 level=logging.WARNING,
             )
             return None
@@ -439,18 +466,35 @@ class TextbookCatalogingService:
         else:
             matter_type = "front"
 
-        isbn = self.find_isbn_in_downloaded_file(downloaded_path, matter_type)
-        if isbn:
-            self.logging_service.write(
-                f"Found ISBN in downloaded file {matter_file['title']!r}: {isbn}"
-            )
-            return self.api_service.lookup_isbn(isbn)
-
-        self.logging_service.write(
-            f"No ISBN found in the downloaded file {matter_file['title']!r}.",
-            level=logging.WARNING,
+        downloaded_isbn = self.find_isbn_in_downloaded_file(
+            downloaded_path, matter_type
         )
-        return None
+
+        if downloaded_isbn and len(downloaded_isbn) == 13:
+            isbn = downloaded_isbn
+            self.logging_service.write(
+                f"Found ISBN-13 in downloaded file {matter_file['title']!r}: {isbn}"
+            )
+        elif isbn_10_candidates:
+            isbn = isbn_10_candidates[0]
+            self.logging_service.write(
+                f"Only ISBN-10 was found in item titles; looking it up: {isbn}"
+            )
+        elif downloaded_isbn:
+            isbn = downloaded_isbn
+            self.logging_service.write(
+                f"Found ISBN-10 in downloaded file {matter_file['title']!r}: {isbn}"
+            )
+        else:
+            # TODO: CHECK on GOOGLE API for ISBN-13.
+            self.logging_service.write(
+                f"No ISBN-13 or ISBN-10 was found in the downloaded file "
+                f"{matter_file['title']!r}. TODO: CHECK on GOOGLE API for ISBN-13.",
+                level=logging.WARNING,
+            )
+            return None
+
+        return lookup_catalog(isbn)
 
     def open_folder(self, driver, wait, folder):
         old_row = folder["_elements"]["row"]
@@ -930,12 +974,38 @@ class TextbookCatalogingService:
         )
 
     def update_folder_from_catalog(self, driver, wait, folder, catalog):
-        isbn_value = catalog.get("isbn_13") or catalog.get("isbn_10")
+        isbn_13_value = catalog.get("isbn_13")
+        if not isinstance(isbn_13_value, (list, tuple)):
+            isbn_13_value = [isbn_13_value]
 
-        if isinstance(isbn_value, (list, tuple)):
-            isbn_value = next((value for value in isbn_value if value), None)
+        isbn = None
+        for value in isbn_13_value:
+            candidate = re.sub(r"[^0-9]", "", str(value or ""))
+            if len(candidate) == 13 and candidate.startswith(("978", "979")):
+                isbn = candidate
+                break
 
-        isbn = re.sub(r"[^0-9Xx]", "", str(isbn_value)).upper() if isbn_value else None
+        selected_isbn = str(getattr(self, "_selected_isbn", "") or "")
+        selected_isbn = re.sub(r"[^0-9Xx]", "", selected_isbn).upper()
+
+        # A directly found ISBN-13 is still usable if the API record omits its ISBN-13 field.
+        if (
+            not isbn
+            and len(selected_isbn) == 13
+            and selected_isbn.startswith(("978", "979"))
+        ):
+            isbn = selected_isbn
+
+        if not isbn:
+            # TODO: CHECK on GOOGLE API for ISBN-13.
+            self.logging_service.write(
+                f"Open Library returned no ISBN-13 for ISBN {selected_isbn!r}; "
+                "stopping before renaming or updating the folder. "
+                "TODO: CHECK on GOOGLE API for ISBN-13.",
+                level=logging.ERROR,
+            )
+            self._catalog_log_context = None
+            return
 
         title = (
             catalog.get("title")
@@ -953,7 +1023,7 @@ class TextbookCatalogingService:
         print("title", title)
 
         self._catalog_log_context = {
-            "isbn": isbn or str(folder.get("title") or ""),
+            "isbn": isbn,
             "catalog_title": title,
             "folder_details": {
                 key: folder.get(key)
@@ -970,12 +1040,12 @@ class TextbookCatalogingService:
             },
         }
 
-        if isbn and isbn != folder["title"]:
+        if isbn != folder["title"]:
             self.rename_sharepoint_folder(driver, wait, folder, isbn)
 
         formats_to_apply = folder.get("format") or folder.get("file_extensions") or []
         self.logging_service.write(
-            f"Applying detected formats for ISBN {isbn or folder['title']!r}: ",
+            f"Applying detected formats for ISBN {isbn!r}: ",
             formats_to_apply,
         )
         self.update_folder_formats(
@@ -1092,7 +1162,7 @@ class TextbookCatalogingService:
             )
         }
         context = {
-            "isbn": isbn or str(folder.get("title") or ""),
+            "isbn": isbn,
             "catalog_title": title,
             "folder_details": details,
         }
