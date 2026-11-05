@@ -124,6 +124,8 @@ class TextbookCatalogingService:
 
     def inspect_open_folder(self, driver, wait, current_folder):
         self._detected_formats = []
+        self._detected_edition = None
+
         supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
         format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
         folders = self.get_folders_to_update(driver)
@@ -139,10 +141,35 @@ class TextbookCatalogingService:
         def title_tokens(item):
             return set(re.findall(r"[a-z0-9]+", normalized_title(item)))
 
+        def edition_from_text(text):
+            match = re.search(
+                r"(?<![A-Za-z0-9])"
+                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?![A-Za-z0-9])",
+                str(text or ""),
+                flags=re.IGNORECASE,
+            )
+            return re.sub(r"[\s-]+", "", match.group(1)).casefold() if match else None
+
+        def record_editions(items):
+            if self._detected_edition:
+                return
+
+            for item in items:
+                edition = edition_from_text(item.get("title"))
+                if edition:
+                    self._detected_edition = edition
+                    self.logging_service.write(
+                        f"Found edition marker in item title "
+                        f"{item.get('title')!r}: {edition}"
+                    )
+                    return
+
         def formats_in(item):
             formats = set()
             title = str(item.get("title") or "")
             extension = os.path.splitext(title)[1].casefold().lstrip(".")
+
             if extension:
                 formats.add(extension if extension in supported_extensions else "other")
 
@@ -151,6 +178,8 @@ class TextbookCatalogingService:
             return formats
 
         def record_formats(items):
+            record_editions(items)
+
             formats = set(self._detected_formats)
             file_extensions = set(current_folder.get("file_extensions") or [])
             listing_extensions = set()
@@ -208,7 +237,8 @@ class TextbookCatalogingService:
 
             return None, file_format
 
-        # Record every file in this listing before attempting ISBN lookup.
+        # Include the current folder name, then record the first listing.
+        record_editions([current_folder])
         record_formats(folders)
 
         format_folders = [
@@ -1010,7 +1040,9 @@ class TextbookCatalogingService:
                 if str(publisher).strip()
             )
 
-        edition = catalog.get("edition_name")
+        edition = getattr(self, "_detected_edition", None) or catalog.get(
+            "edition_name"
+        )
 
         if not edition:
             notes = catalog.get("notes")
@@ -1028,12 +1060,14 @@ class TextbookCatalogingService:
             )
 
             match = re.search(
-                r"\b\d+(?:st|nd|rd|th)\s+edition\b",
+                r"(?<![A-Za-z0-9])"
+                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?![A-Za-z0-9])",
                 edition_text,
                 flags=re.IGNORECASE,
             )
             if match:
-                edition = match.group(0)
+                edition = re.sub(r"[\s-]+", "", match.group(1)).casefold()
 
         self.update_folder_text_field(driver, wait, folder, "book_title", title)
         self.update_folder_text_field(driver, wait, folder, "author", authors)
@@ -1243,6 +1277,24 @@ class TextbookCatalogingService:
             raise ValueError(f"Unsupported file type: {extension}")
 
         text = "\n".join(text_parts)
+
+        # Use text from the downloaded file only when no title contained an edition.
+        if not getattr(self, "_detected_edition", None):
+            match = re.search(
+                r"(?<![A-Za-z0-9])"
+                r"(\d{1,2}\s*e|\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
+                r"(?![A-Za-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                self._detected_edition = re.sub(
+                    r"[\s-]+", "", match.group(1)
+                ).casefold()
+                self.logging_service.write(
+                    f"Found edition marker in downloaded text: "
+                    f"{self._detected_edition}"
+                )
 
         for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
             for match in pattern.finditer(text):
