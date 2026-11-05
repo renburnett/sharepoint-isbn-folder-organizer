@@ -169,13 +169,29 @@ class TextbookCatalogingService:
         def formats_in(item):
             formats = set()
             title = str(item.get("title") or "")
+
+            if item.get("is_folder"):
+                formats.update(title_tokens(item) & supported_extensions)
+                return formats
+
             extension = os.path.splitext(title)[1].casefold().lstrip(".")
 
-            if extension:
-                formats.add(extension if extension in supported_extensions else "other")
+            # For files, trust the actual extension when it is supported.
+            if extension in supported_extensions:
+                formats.add(extension)
+                return formats
 
-            title_format_tokens = title_tokens(item)
-            formats.update(title_format_tokens & supported_extensions)
+            # If the extension is missing or unsupported, use the Formats field.
+            format_text = str(item.get("format") or "").casefold()
+            formats.update(
+                token
+                for token in re.findall(r"[a-z0-9]+", format_text)
+                if token in supported_extensions
+            )
+
+            if not formats and extension:
+                formats.add("other")
+
             return formats
 
         def record_formats(items):
@@ -384,11 +400,11 @@ class TextbookCatalogingService:
         isbn_10_candidates = []
 
         for item in search_items:
-            isbn, file_format = isbn_from_title(item, self.ISBN_13_PATTERN)
+            isbn, _ = isbn_from_title(item, self.ISBN_13_PATTERN)
             if isbn and isbn not in isbn_13_candidates:
                 isbn_13_candidates.append(isbn)
 
-            isbn, file_format = isbn_from_title(item, self.ISBN_10_PATTERN)
+            isbn, _ = isbn_from_title(item, self.ISBN_10_PATTERN)
             if isbn and isbn not in isbn_10_candidates:
                 isbn_10_candidates.append(isbn)
 
