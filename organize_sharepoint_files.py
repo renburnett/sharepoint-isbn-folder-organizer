@@ -1873,6 +1873,9 @@ class TextbookCatalogingService:
                 expected_fields,
                 max_retries=2,
             )
+            if verified_folder is None:
+                self._catalog_log_context = None
+                return False
             folder.update(verified_folder)
         except (TimeoutException, TimeoutError) as exc:
             self.logging_service.write(
