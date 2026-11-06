@@ -5,7 +5,7 @@ import logging
 
 
 class ApiService:
-    API_TIMEOUT = (5, 10)
+    API_TIMEOUT = (7, 13)
     # TODO: set this to True once authentication and response schema are set up and handled
     GOOGLE_BOOKS_FALLBACK_ENABLED = False
 
@@ -109,7 +109,7 @@ class ApiService:
                 if attempt == max_attempts:
                     break
 
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(1 ** (attempt - 1))
 
         if not self.GOOGLE_BOOKS_FALLBACK_ENABLED:
             return None
