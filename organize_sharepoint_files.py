@@ -29,6 +29,8 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
     StaleElementReferenceException,
     TimeoutException,
+    NoAlertPresentException,
+    UnexpectedAlertPresentException,
 )
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -50,7 +52,7 @@ class TextbookCatalogingService:
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
     MAX_PAGES_TO_SCAN = 8
-    MAX_FOLDERS_TO_RENAME = 3
+    MAX_FOLDERS_TO_RENAME = 12
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -142,6 +144,10 @@ class TextbookCatalogingService:
             ".epub",
         }
         folders = self.get_folders_to_update(driver)
+        traversed_items = []
+        file_locations = []
+        root_url = driver.current_url
+        root_signature = self.get_listing_signature(driver)
 
         def normalized_title(item):
             return (
@@ -153,6 +159,14 @@ class TextbookCatalogingService:
 
         def title_tokens(item):
             return set(re.findall(r"[a-z0-9]+", normalized_title(item)))
+
+        def is_front_matter(item):
+            return bool(title_tokens(item) & {"front", "frontmatter", "fm"})
+
+        def is_end_matter(item):
+            return bool(
+                title_tokens(item) & {"end", "back", "bm", "endmatter", "backmatter"}
+            )
 
         def edition_from_text(text):
             match = re.search(
@@ -193,7 +207,6 @@ class TextbookCatalogingService:
                 return formats
 
             extension = os.path.splitext(title)[1].casefold().lstrip(".")
-
             if extension in supported_extensions:
                 formats.add(extension)
                 return formats
@@ -222,8 +235,11 @@ class TextbookCatalogingService:
                 if item.get("is_folder"):
                     continue
 
-                title = str(item.get("title") or "")
-                extension = os.path.splitext(title)[1].casefold().lstrip(".")
+                extension = (
+                    os.path.splitext(str(item.get("title") or ""))[1]
+                    .casefold()
+                    .lstrip(".")
+                )
                 if extension:
                     file_extensions.add(extension)
                     listing_extensions.add(extension)
@@ -275,7 +291,6 @@ class TextbookCatalogingService:
             catalog = self.api_service.lookup_isbn(isbn)
 
             if not catalog:
-                # TODO: CHECK on GOOGLE API for ISBN-13.
                 self.logging_service.write(
                     f"Open Library did not return a record for ISBN {isbn}. "
                     "TODO: CHECK on GOOGLE API for ISBN-13.",
@@ -291,125 +306,297 @@ class TextbookCatalogingService:
             extension = os.path.splitext(str(item.get("title") or ""))[1].casefold()
             return extension in scannable_extensions
 
+        def register_files(items, folder_path):
+            for item in items:
+                if not item.get("is_folder"):
+                    file_locations.append((item, tuple(folder_path)))
+
+        def open_and_read_folder(folder, purpose):
+            try:
+                self.open_folder(driver, wait, folder)
+                items = self.get_folders_to_update(driver)
+                traversed_items.extend(items)
+                record_formats(items)
+                return items
+            except Exception as exc:
+                self.logging_service.exception(
+                    f"Could not open/read nested folder {folder.get('title')!r} "
+                    f"while {purpose}; skipping this folder. "
+                    f"Error: {type(exc).__name__}: {exc}"
+                )
+                return None
+
+        def return_to_listing(target_url, target_signature):
+            try:
+                driver.back()
+                wait.until(
+                    lambda d: d.current_url == target_url
+                    and self.get_listing_signature(d) == target_signature
+                )
+                self.wait_for_folder_listing(driver)
+                return True
+            except Exception as exc:
+                self.logging_service.exception(
+                    f"Could not return to the parent SharePoint listing. "
+                    f"Error: {type(exc).__name__}: {exc}"
+                )
+                return False
+
+        def descend_single_child_chain(first_folder, first_items):
+            path = [str(first_folder.get("title") or "")]
+            navigation_stack = [(root_url, root_signature)]
+            items = first_items
+            max_depth = 20
+
+            for depth in range(max_depth):
+                child_folders = [item for item in items if item.get("is_folder")]
+
+                if not child_folders:
+                    register_files(items, path)
+
+                    while navigation_stack:
+                        target_url, target_signature = navigation_stack.pop()
+                        if not return_to_listing(target_url, target_signature):
+                            return None
+
+                    return items
+
+                # Keep following a single-folder-only chain as before.
+                if len(items) == 1 and len(child_folders) == 1:
+                    child_folder = child_folders[0]
+                    navigation_stack.append(
+                        (driver.current_url, self.get_listing_signature(driver))
+                    )
+                    path.append(str(child_folder.get("title") or ""))
+
+                    self.logging_service.write(
+                        f"Opening single-child nested folder "
+                        f"(level {depth + 1}): {child_folder.get('title')!r}"
+                    )
+
+                    items = open_and_read_folder(
+                        child_folder,
+                        f"following the single-child folder chain under "
+                        f"{first_folder.get('title')!r}",
+                    )
+                    if items is None:
+                        return None
+                    continue
+
+                # Also allow up to four shallow sibling folders at this level,
+                # alongside any files in the current listing.
+                if len(child_folders) > 4:
+                    self.logging_service.write(
+                        f"Cannot follow nested folders under "
+                        f"{first_folder.get('title')!r}: found "
+                        f"{len(child_folders)} child folders; at most four "
+                        f"shallow child folders are allowed. Contents: "
+                        f"{listing(items)}",
+                        level=logging.WARNING,
+                    )
+                    return None
+
+                register_files(items, path)
+
+                for child_folder in child_folders:
+                    child_title = str(child_folder.get("title") or "")
+                    parent_url = driver.current_url
+                    parent_signature = self.get_listing_signature(driver)
+
+                    live_child = next(
+                        (
+                            candidate
+                            for candidate in self.get_folders_to_update(driver)
+                            if candidate.get("is_folder")
+                            and str(candidate.get("title") or "") == child_title
+                        ),
+                        None,
+                    )
+                    if not live_child:
+                        self.logging_service.write(
+                            f"Could not find shallow child folder "
+                            f"{child_title!r} under "
+                            f"{first_folder.get('title')!r}; skipping this "
+                            "parent folder.",
+                            level=logging.WARNING,
+                        )
+                        return None
+
+                    self.logging_service.write(
+                        f"Opening shallow child folder: {child_title!r}"
+                    )
+                    child_items = open_and_read_folder(
+                        live_child,
+                        f"inspecting a shallow child folder under "
+                        f"{first_folder.get('title')!r}",
+                    )
+                    if child_items is None:
+                        return None
+
+                    if any(item.get("is_folder") for item in child_items):
+                        self.logging_service.write(
+                            f"Cannot follow shallow child folder "
+                            f"{child_title!r} under "
+                            f"{first_folder.get('title')!r}: it contains "
+                            f"another folder. Contents: {listing(child_items)}",
+                            level=logging.WARNING,
+                        )
+                        return None
+
+                    register_files(child_items, path + [child_title])
+                    if not return_to_listing(parent_url, parent_signature):
+                        return None
+
+                while navigation_stack:
+                    target_url, target_signature = navigation_stack.pop()
+                    if not return_to_listing(target_url, target_signature):
+                        return None
+
+                return items
+
+            self.logging_service.write(
+                f"Stopped nested-folder traversal under "
+                f"{first_folder.get('title')!r} after {max_depth} levels.",
+                level=logging.WARNING,
+            )
+            return None
+
         record_editions([current_folder])
         record_formats(folders)
+        register_files(folders, ())
 
-        format_folders = [
-            item
-            for item in folders
-            if item.get("is_folder") and formats_in(item) & supported_extensions
-        ]
-        unexpected_folders = [
-            item
-            for item in folders
-            if item.get("is_folder") and item not in format_folders
-        ]
+        child_folders = [item for item in folders if item.get("is_folder")]
 
-        contents = []
-        used_unexpected_nesting = False
-
-        if unexpected_folders and not format_folders:
-            unexpected_folder = unexpected_folders[0]
-            self.logging_service.write(
-                "Unexpected subfolder; inspecting its listing:",
-                unexpected_folder.get("title"),
-                level=logging.INFO,
-            )
-
-            self.open_folder(driver, wait, unexpected_folder)
-            unexpected_contents = self.get_folders_to_update(driver)
-            record_formats(unexpected_contents)
-
-            child_folders = [
-                item for item in unexpected_contents if item.get("is_folder")
-            ]
-
-            if len(unexpected_contents) == 1 and len(child_folders) == 1:
-                child_folder = child_folders[0]
+        if len(child_folders) == 1:
+            child_folder = child_folders[0]
+            if formats_in(child_folder):
                 self.logging_service.write(
-                    "Opening its single subfolder:",
+                    "Opening format folder:", child_folder["title"]
+                )
+            else:
+                self.logging_service.write(
+                    "Unexpected subfolder; inspecting its listing:",
                     child_folder.get("title"),
                     level=logging.INFO,
                 )
 
-                self.open_folder(driver, wait, child_folder)
-                contents = self.get_folders_to_update(driver)
-                record_formats(contents)
+            child_items = open_and_read_folder(
+                child_folder,
+                "inspecting its child folder",
+            )
+            if child_items is None:
+                return None
 
-                if any(item.get("is_folder") for item in contents):
-                    self.logging_service.write(
-                        f"Unexpected deeper folder(s) inside "
-                        f"{child_folder['title']!r}. "
-                        f"Contents: {listing(contents)}",
-                        level=logging.WARNING,
-                    )
-                    return None
+            if descend_single_child_chain(child_folder, child_items) is None:
+                return None
 
-                used_unexpected_nesting = True
-
-            elif child_folders:
+        elif child_folders:
+            if len(child_folders) > 4:
                 self.logging_service.write(
-                    f"Unexpected subfolder structure in "
-                    f"{unexpected_folder.get('title')!r}. "
-                    f"Contents: {listing(unexpected_contents)}",
+                    f"Skipping folder {current_folder.get('title')!r}: found "
+                    f"{len(child_folders)} immediate child folders; at most four "
+                    "are supported in this layout.",
                     level=logging.WARNING,
                 )
                 return None
 
-            else:
-                contents = unexpected_contents
-                record_formats(contents)
-                used_unexpected_nesting = True
+            for child_folder in child_folders:
+                child_title = str(child_folder.get("title") or "")
+                parent_url = driver.current_url
+                parent_signature = self.get_listing_signature(driver)
 
-        def folder_priority(item):
-            item_formats = formats_in(item)
-            first_format = next(
-                (ext for ext in format_priority if ext in item_formats),
-                "other",
-            )
-            format_rank = (
-                format_priority.index(first_format)
-                if first_format in format_priority
-                else 99
-            )
-            is_split = "split" in normalized_title(item)
-            split_pdf = is_split and "pdf" in item_formats
-
-            return (
-                (
-                    0
-                    if split_pdf
-                    else 1 if first_format == "pdf" else 2 if is_split else 3
-                ),
-                format_rank,
-            )
-
-        supported_format_folder = None
-
-        if not used_unexpected_nesting:
-            supported_format_folder = (
-                min(format_folders, key=folder_priority) if format_folders else None
-            )
-
-            if supported_format_folder:
-                self.logging_service.write(
-                    "Opening format folder:", supported_format_folder["title"]
+                live_child = next(
+                    (
+                        item
+                        for item in self.get_folders_to_update(driver)
+                        if item.get("is_folder")
+                        and str(item.get("title") or "") == child_title
+                    ),
+                    None,
                 )
-                self.open_folder(driver, wait, supported_format_folder)
-                contents = self.get_folders_to_update(driver)
-                record_formats(contents)
-
-                if any(item.get("is_folder") for item in contents):
+                if not live_child:
                     self.logging_service.write(
-                        f"Unexpected deeper folder(s) inside "
-                        f"{supported_format_folder['title']!r}. "
-                        f"Contents: {listing(contents)}",
+                        f"Could not find child folder {child_title!r} in the "
+                        "current listing; skipping this parent folder.",
                         level=logging.WARNING,
                     )
                     return None
 
+                self.logging_service.write("Opening sibling folder:", child_title)
+                child_items = open_and_read_folder(
+                    live_child,
+                    "inspecting a sibling folder",
+                )
+                if child_items is None:
+                    return None
+
+                child_signature = self.get_listing_signature(driver)
+                child_url = driver.current_url
+                nested_folders = [item for item in child_items if item.get("is_folder")]
+                child_is_pdf = "pdf" in formats_in(child_folder)
+
+                if not nested_folders:
+                    register_files(child_items, (child_title,))
+                    if not return_to_listing(parent_url, parent_signature):
+                        return None
+                    continue
+
+                if child_is_pdf and len(child_items) == 1 and len(nested_folders) == 1:
+                    nested_folder = nested_folders[0]
+                    nested_title = str(nested_folder.get("title") or "")
+
+                    nested_items = open_and_read_folder(
+                        nested_folder,
+                        f"inspecting the single nested folder inside "
+                        f"PDF folder {child_title!r}",
+                    )
+                    if nested_items is None:
+                        return None
+
+                    nested_files = [
+                        item for item in nested_items if not item.get("is_folder")
+                    ]
+                    nested_has_only_pdf_files = (
+                        bool(nested_files)
+                        and not any(item.get("is_folder") for item in nested_items)
+                        and all(
+                            os.path.splitext(str(item.get("title") or ""))[1].casefold()
+                            == ".pdf"
+                            for item in nested_files
+                        )
+                    )
+
+                    if not nested_has_only_pdf_files:
+                        self.logging_service.write(
+                            f"Skipping folder {current_folder.get('title')!r}: "
+                            f"nested folder {nested_title!r} inside PDF folder "
+                            f"{child_title!r} does not contain only PDF files. "
+                            f"Contents: {listing(nested_items)}",
+                            level=logging.WARNING,
+                        )
+                        return None
+
+                    register_files(
+                        nested_items,
+                        (child_title, nested_title),
+                    )
+
+                    if not return_to_listing(child_url, child_signature):
+                        return None
+                    if not return_to_listing(parent_url, parent_signature):
+                        return None
+                    continue
+
+                self.logging_service.write(
+                    f"Skipping folder {current_folder.get('title')!r}: "
+                    f"child folder {child_title!r} contains an unsupported deeper "
+                    f"structure. Contents: {listing(child_items)}",
+                    level=logging.WARNING,
+                )
+                return None
+
         search_items = sorted(
-            folders + contents,
+            folders + traversed_items,
             key=lambda item: (
                 0
                 if format_for(item) == "pdf"
@@ -434,46 +621,87 @@ class TextbookCatalogingService:
             self.logging_service.write(f"Found ISBN-13 in item titles: {isbn}")
             return lookup_catalog(isbn)
 
-        if supported_format_folder or used_unexpected_nesting:
-            current_items = contents
-        else:
-            current_items = folders
+        if not child_folders:
             self.logging_service.write(
                 "No supported-format folder was found; checking the current folder.",
                 level=logging.WARNING,
             )
 
-        matter_files = [
-            item
-            for item in current_items
-            if is_scannable_file(item) and "matter" in normalized_title(item)
+        scannable_files = [
+            (item, path) for item, path in file_locations if is_scannable_file(item)
         ]
-        matter_files.sort(
-            key=lambda item: (
-                0 if format_for(item) == "pdf" else 1,
+        scannable_files.sort(
+            key=lambda entry: (
+                0 if format_for(entry[0]) == "pdf" else 1,
                 (
-                    format_priority.index(format_for(item))
-                    if format_for(item) in format_priority
+                    format_priority.index(format_for(entry[0]))
+                    if format_for(entry[0]) in format_priority
                     else 99
                 ),
             )
         )
 
-        front_matter_file = next(
-            (item for item in matter_files if "front" in title_tokens(item)),
+        front_matter_entry = next(
+            (entry for entry in scannable_files if is_front_matter(entry[0])),
             None,
         )
-        end_matter_file = next(
-            (item for item in matter_files if {"end", "back"} & title_tokens(item)),
+        end_matter_entry = next(
+            (entry for entry in scannable_files if is_end_matter(entry[0])),
+            None,
+        )
+        other_matter_entry = next(
+            (
+                entry
+                for entry in scannable_files
+                if "matter" in normalized_title(entry[0])
+                and not is_front_matter(entry[0])
+                and not is_end_matter(entry[0])
+            ),
+            None,
+        )
+        copyright_entry = next(
+            (
+                entry
+                for entry in scannable_files
+                if "copyright" in title_tokens(entry[0])
+            ),
+            None,
+        )
+        title_entry = next(
+            (entry for entry in scannable_files if "title" in title_tokens(entry[0])),
             None,
         )
 
-        matter_file = front_matter_file or end_matter_file
-        if matter_file is None:
-            scannable_files = [
-                item for item in current_items if is_scannable_file(item)
-            ]
-            matter_file = scannable_files[0] if scannable_files else None
+        matter_entry = (
+            front_matter_entry
+            or end_matter_entry
+            or other_matter_entry
+            or copyright_entry
+            or title_entry
+            or (scannable_files[0] if scannable_files else None)
+        )
+
+        if front_matter_entry:
+            selection_reason = "front matter"
+        elif end_matter_entry:
+            selection_reason = "end matter"
+        elif other_matter_entry:
+            selection_reason = "other matter file"
+        elif copyright_entry:
+            selection_reason = "copyright file"
+        elif title_entry:
+            selection_reason = "title file"
+        else:
+            selection_reason = "first scannable file"
+
+        if matter_entry:
+            matter_file, matter_path = matter_entry
+            self.logging_service.write(
+                f"Selected {selection_reason}: {matter_file['title']!r}"
+            )
+        else:
+            matter_file = None
+            matter_path = ()
 
         if not matter_file:
             if isbn_10_candidates:
@@ -490,23 +718,76 @@ class TextbookCatalogingService:
             )
             return None
 
-        self.logging_service.write(
-            "Found a possible matter file:", matter_file["title"]
-        )
-        downloaded_path = self.download_sharepoint_file(driver, wait, matter_file)
-        self.logging_service.write("Downloaded:", downloaded_path)
+        matter_type = "end" if is_end_matter(matter_file) else "front"
+        downloaded_path = None
 
-        matter_tokens = title_tokens(matter_file)
-        if "front" in matter_tokens:
-            matter_type = "front"
-        elif {"end", "back"} & matter_tokens:
-            matter_type = "end"
-        else:
-            matter_type = "front"
+        try:
+            for folder_title in matter_path:
+                live_items = self.get_folders_to_update(driver)
+                live_folder = next(
+                    (
+                        item
+                        for item in live_items
+                        if item.get("is_folder")
+                        and str(item.get("title") or "") == folder_title
+                    ),
+                    None,
+                )
+                if not live_folder:
+                    raise TimeoutError(
+                        f"Could not reopen folder {folder_title!r} to download "
+                        f"{matter_file['title']!r}."
+                    )
+                self.open_folder(driver, wait, live_folder)
 
-        downloaded_isbn = self.find_isbn_in_downloaded_file(
-            downloaded_path, matter_type
-        )
+            live_items = self.get_folders_to_update(driver)
+            live_matter_file = next(
+                (
+                    item
+                    for item in live_items
+                    if not item.get("is_folder")
+                    and str(item.get("title") or "")
+                    == str(matter_file.get("title") or "")
+                ),
+                None,
+            )
+            if not live_matter_file:
+                raise TimeoutError(
+                    f"Could not find matter file {matter_file['title']!r} "
+                    "in its folder listing."
+                )
+
+            downloaded_path = self.download_sharepoint_file(
+                driver,
+                wait,
+                live_matter_file,
+            )
+            self.logging_service.write("Downloaded:", downloaded_path)
+
+            downloaded_isbn = self.find_isbn_in_downloaded_file(
+                downloaded_path,
+                matter_type,
+            )
+        except Exception as exc:
+            self.logging_service.exception(
+                f"Failed to download or scan matter file {matter_file['title']!r} "
+                f"for folder {current_folder.get('title')!r}; skipping this folder "
+                f"and continuing. Error: {type(exc).__name__}: {exc}"
+            )
+            return None
+        finally:
+            if downloaded_path is not None and downloaded_path.is_file():
+                try:
+                    downloaded_path.unlink()
+                    self.logging_service.write(
+                        f"Deleted temporary downloaded file: {downloaded_path}"
+                    )
+                except OSError as cleanup_error:
+                    self.logging_service.write(
+                        f"Could not delete temporary downloaded file "
+                        f"{downloaded_path}: {cleanup_error}",
+                        level=logging.WARNING,
+                    )
 
         if downloaded_isbn and len(downloaded_isbn) == 13:
             isbn = downloaded_isbn
@@ -526,7 +807,8 @@ class TextbookCatalogingService:
         else:
             self.logging_service.write(
                 f"No ISBN-13 or ISBN-10 was found in the downloaded file "
-                f"{matter_file['title']!r}. TODO: CHECK on GOOGLE API for ISBN-13.",
+                f"{matter_file['title']!r}. "
+                "TODO: CHECK on GOOGLE API for ISBN-13.",
                 level=logging.WARNING,
             )
             return None
@@ -535,9 +817,27 @@ class TextbookCatalogingService:
 
     def open_folder(self, driver, wait, folder):
         old_row = folder["_elements"]["row"]
+        title_element = folder["_elements"]["title"]
         old_url = driver.current_url
         old_signature = self.get_listing_signature(driver)
-        wait.until(EC.element_to_be_clickable(folder["_elements"]["title"])).click()
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            title_element,
+        )
+        wait.until(EC.element_to_be_clickable(title_element))
+
+        try:
+            title_element.click()
+        except ElementClickInterceptedException:
+            self.logging_service.write(
+                f"Folder title click was intercepted for {folder.get('title')!r}; "
+                "retrying with a DOM click because a SharePoint header or "
+                "overlay covered the title.",
+                level=logging.WARNING,
+            )
+            driver.execute_script("arguments[0].click();", title_element)
+
         wait.until(EC.any_of(EC.staleness_of(old_row), EC.url_changes(old_url)))
         self.wait_for_folder_listing(driver, previous_signature=old_signature)
 
@@ -743,10 +1043,8 @@ class TextbookCatalogingService:
         title_cell.click()
 
         try:
-            # Give the first click a moment to open the editor.
             editor = WebDriverWait(driver, 2).until(find_visible_editor)
         except TimeoutException:
-            # Don't click again if the first click navigated or changed the listing.
             if (
                 driver.current_url != original_url
                 or self.get_listing_signature(driver) != original_signature
@@ -755,7 +1053,6 @@ class TextbookCatalogingService:
                     "Clicking the title changed the listing instead of opening its editor."
                 )
 
-            # Refresh the row reference, then try the title cell once more.
             current_folder = self.get_folder_by_title(driver, old_title)
             if not current_folder:
                 raise TimeoutException(
@@ -777,26 +1074,54 @@ class TextbookCatalogingService:
         editor.send_keys(new_title)
         editor.send_keys(Keys.ENTER)
 
-        wait.until(
-            EC.any_of(
-                EC.staleness_of(editor),
-                EC.invisibility_of_element(editor),
-            )
+        error_message_locator = (
+            By.CSS_SELECTOR,
+            '[data-automationid="list-info-callout-container"] '
+            '[data-automationid="AsReactChildren"]',
         )
-        wait.until(lambda d: new_title in self.get_listing_signature(d))
+
+        def rename_result(driver):
+            for message_element in driver.find_elements(*error_message_locator):
+                if not message_element.is_displayed():
+                    continue
+
+                message = (message_element.text or "").strip()
+                if message:
+                    return "error", message
+
+            current_titles = self.get_listing_signature(driver)
+            if old_title not in current_titles and new_title in current_titles:
+                return "renamed", None
+
+            return False
+
+        result, message = wait.until(rename_result)
+
+        if result == "error":
+            context = getattr(self, "_catalog_log_context", None)
+            self.logging_service.write(
+                f"SharePoint rejected the folder rename. "
+                f"Current folder: {old_title!r}; requested title: {new_title!r}; "
+                f"SharePoint message: {message!r}; catalog context: {context!r}. "
+                "Skipping this folder and continuing.",
+                level=logging.ERROR,
+            )
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            return False
 
         folder["title"] = new_title
-
         updated_folder = self.get_folder_by_title(driver, new_title)
         if updated_folder:
             folder.update(updated_folder)
+
+        return True
 
     def update_folder_formats(self, driver, wait, folder, formats):
         format_aliases = {
             "pdf": ("PDF",),
             "epub": ("Epub",),
             "docx": ("Docx",),
-            "doc": ("Doc", "Word"),
+            "doc": ("Docx",),
             "tif": ("TIF",),
             "tiff": ("TIF",),
         }
@@ -843,30 +1168,49 @@ class TextbookCatalogingService:
                 EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
             )
 
+        current_tokens = set(
+            re.findall(r"[a-z0-9]+", str(folder.get("format") or "").casefold())
+        )
+        already_selected = {
+            extension
+            for extension, aliases in format_aliases.items()
+            if any(alias.casefold() in current_tokens for alias in aliases)
+        }
         selected_titles = set()
 
         for extension in extensions:
+            if extension in already_selected:
+                continue
+
             callout = wait.until(
                 EC.visibility_of_element_located((By.ID, "CommonEditorCalloutId"))
             )
             options = callout.find_elements(By.CSS_SELECTOR, '[role="option"]')
+            aliases = {alias.casefold() for alias in format_aliases[extension]}
+
+            def option_matches(candidate):
+                labels = (
+                    candidate.get_attribute("title"),
+                    candidate.get_attribute("aria-label"),
+                    candidate.text,
+                )
+                option_tokens = {
+                    token
+                    for label in labels
+                    for token in re.findall(r"[a-z0-9]+", str(label or "").casefold())
+                }
+                return bool(aliases & option_tokens)
 
             option = next(
-                (
-                    candidate
-                    for candidate in options
-                    if (candidate.get_attribute("title") or candidate.text)
-                    .strip()
-                    .casefold()
-                    in {alias.casefold() for alias in format_aliases[extension]}
-                ),
+                (candidate for candidate in options if option_matches(candidate)),
                 None,
             )
 
             if option is None:
                 self.logging_service.write(
                     f"No SharePoint Formats choice found for {extension!r}; "
-                    "skipping it.",
+                    f"available choices: "
+                    f"{[option.text for option in options]!r}; skipping it.",
                     level=logging.WARNING,
                 )
                 continue
@@ -976,7 +1320,7 @@ class TextbookCatalogingService:
         editor.send_keys(str(value))
         editor.send_keys(Keys.ENTER)
 
-        # Tab moves focus out of the editor so SharePoint can commit the value.
+        # Tab leaves the inline editor; persistence is checked after reload.
         ActionChains(driver).send_keys(Keys.TAB).perform()
 
         wait.until(
@@ -988,7 +1332,7 @@ class TextbookCatalogingService:
 
         expected_value = " ".join(str(value).split()).casefold()
 
-        def field_value_saved(driver):
+        def field_value_visible(driver):
             updated_folder = self.get_folder_by_title(driver, folder_title)
             if not updated_folder:
                 return False
@@ -1004,20 +1348,287 @@ class TextbookCatalogingService:
             return True
 
         try:
-            wait.until(field_value_saved)
+            wait.until(field_value_visible)
         except TimeoutException as exc:
             updated_folder = self.get_folder_by_title(driver, folder_title)
             actual_value = updated_folder.get(field_name) if updated_folder else None
             raise TimeoutException(
-                f"SharePoint did not confirm saving {field_name!r} "
+                f"The current SharePoint view did not reflect {field_name!r} "
                 f"for folder {folder_title!r}. Expected {value!r}; "
                 f"found {actual_value!r}."
             ) from exc
 
         self.logging_service.write(
-            f"Saved SharePoint {field_name!r} for folder " f"{folder_title!r}: ",
+            f"SharePoint's current view shows {field_name!r} for "
+            f"{folder_title!r}: ",
             value,
         )
+
+    def verify_folder_catalog_update(
+        self,
+        driver,
+        wait,
+        original_title,
+        expected_title,
+        expected_formats,
+        expected_fields,
+        max_retries=2,
+    ):
+        format_names = {
+            "pdf": "pdf",
+            "epub": "epub",
+            "docx": "docx",
+            "doc": "docx",
+            "word": "docx",
+            "tif": "tif",
+            "tiff": "tif",
+        }
+
+        expected_format_set = {
+            format_names[str(extension).casefold()]
+            for extension in expected_formats
+            if str(extension).casefold() in format_names
+        }
+
+        def normalized(value):
+            return " ".join(str(value or "").split()).casefold()
+
+        def normalized_formats(value):
+            tokens = re.findall(r"[a-z0-9]+", str(value or "").casefold())
+            return {format_names[token] for token in tokens if token in format_names}
+
+        def handle_reload_warning():
+            try:
+                alert = driver.switch_to.alert
+            except NoAlertPresentException:
+                return False
+
+            alert_text = alert.text.casefold()
+            if not any(
+                phrase in alert_text
+                for phrase in ("may not be saved", "changes you made", "unsaved")
+            ):
+                alert.dismiss()
+                raise TimeoutException(
+                    f"Unexpected browser confirmation during save verification: "
+                    f"{alert_text!r}"
+                )
+
+            self.logging_service.write(
+                "SharePoint warned about pending changes. Reloading to check "
+                "what persisted; missing values will be reapplied.",
+                level=logging.WARNING,
+            )
+            alert.accept()
+            return True
+
+        def find_target_folder(driver):
+            try:
+                return self.get_folder_by_title(
+                    driver, expected_title
+                ) or self.get_folder_by_title(driver, original_title)
+            except StaleElementReferenceException:
+                return False
+
+        def has_visible_see_more(driver):
+            try:
+                return any(
+                    button.is_displayed()
+                    for button in driver.find_elements(
+                        By.CSS_SELECTOR,
+                        'div[role="gridcell"][class*="seeMoreCell"] button',
+                    )
+                )
+            except StaleElementReferenceException:
+                return False
+
+        def exit_grid_view(current_folder):
+            current_folder = (
+                self.get_folder_by_title(driver, expected_title) or current_folder
+            )
+            title_element = current_folder["_elements"]["title"]
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});",
+                title_element,
+            )
+            ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
+
+            folder_row = title_element.find_element(
+                By.XPATH,
+                "./ancestor::*[@role='row'][1]",
+            )
+            more_actions = wait.until(
+                lambda d: next(
+                    (
+                        button
+                        for button in folder_row.find_elements(
+                            By.CSS_SELECTOR,
+                            'button[data-automationid="moreActionsHeroField"]',
+                        )
+                        if button.is_displayed() and button.is_enabled()
+                    ),
+                    False,
+                )
+            )
+            driver.execute_script("arguments[0].click();", more_actions)
+
+            exit_grid_locator = (
+                By.CSS_SELECTOR,
+                'button[data-automationid="exitGridCommand"]',
+            )
+            exit_grid_button = wait.until(
+                EC.visibility_of_element_located(exit_grid_locator)
+            )
+            driver.execute_script("arguments[0].click();", exit_grid_button)
+            wait.until(EC.invisibility_of_element_located(exit_grid_locator))
+            self.logging_service.write(
+                f"Exited grid view after retrying catalog values for "
+                f"{expected_title!r}."
+            )
+            return self.get_folder_by_title(driver, expected_title) or current_folder
+
+        def reload_and_read_folder():
+            try:
+                driver.refresh()
+            except UnexpectedAlertPresentException:
+                if not handle_reload_warning():
+                    raise TimeoutException(
+                        "SharePoint blocked the reload, so saved values "
+                        "could not be verified."
+                    )
+
+            try:
+                handle_reload_warning()
+                wait.until(
+                    lambda d: d.execute_script("return document.readyState")
+                    == "complete"
+                )
+            except UnexpectedAlertPresentException:
+                if not handle_reload_warning():
+                    raise TimeoutException(
+                        "SharePoint blocked the reload, so saved values "
+                        "could not be verified."
+                    )
+                wait.until(
+                    lambda d: d.execute_script("return document.readyState")
+                    == "complete"
+                )
+
+            navigation_type = driver.execute_script(
+                "const entry = performance.getEntriesByType('navigation')[0]; "
+                "return entry ? entry.type : null;"
+            )
+            if navigation_type != "reload":
+                raise TimeoutException(
+                    "The browser did not complete a fresh reload; "
+                    "SharePoint values cannot be confirmed."
+                )
+
+            see_more_locator = (
+                By.CSS_SELECTOR,
+                'div[role="gridcell"][class*="seeMoreCell"] button',
+            )
+
+            for _ in range(3):
+                current_folder = find_target_folder(driver)
+                if current_folder:
+                    return current_folder
+
+                if has_visible_see_more(driver):
+                    self.click_safely(driver, wait, see_more_locator)
+                    continue
+
+                wait.until(lambda d: find_target_folder(d) or has_visible_see_more(d))
+
+            return wait.until(find_target_folder)
+
+        for verification_round in range(max_retries + 1):
+            current_folder = reload_and_read_folder()
+
+            mismatched_fields = {
+                field_name: expected_value
+                for field_name, expected_value in expected_fields.items()
+                if normalized(current_folder.get(field_name))
+                != normalized(expected_value)
+            }
+            title_mismatch = normalized(current_folder.get("title")) != normalized(
+                expected_title
+            )
+            actual_formats = normalized_formats(current_folder.get("format"))
+            missing_formats = expected_format_set - actual_formats
+            grid_view_open = False
+
+            if not title_mismatch and not mismatched_fields and not missing_formats:
+                self.logging_service.write(
+                    f"VERIFIED after reload: folder {expected_title!r}, "
+                    f"formats {sorted(actual_formats)}, and fields "
+                    f"{expected_fields!r} persisted in SharePoint."
+                )
+                return current_folder
+
+            details = {
+                "folder_title": current_folder.get("title"),
+                "formats": current_folder.get("format"),
+                **{
+                    field_name: current_folder.get(field_name)
+                    for field_name in expected_fields
+                },
+            }
+
+            if verification_round == max_retries:
+                message = (
+                    f"SharePoint values did not persist after {max_retries} "
+                    f"retries. Expected folder {expected_title!r}, formats "
+                    f"{sorted(expected_format_set)}, and fields "
+                    f"{expected_fields!r}; reloaded values: {details!r}."
+                )
+                self.logging_service.write(message, level=logging.ERROR)
+                raise TimeoutException(message)
+
+            self.logging_service.write(
+                f"Reload verification found unsaved values; retry "
+                f"{verification_round + 1} of {max_retries}. "
+                f"Current values: {details!r}",
+                level=logging.WARNING,
+            )
+
+            if title_mismatch:
+                if not self.rename_sharepoint_folder(
+                    driver, wait, current_folder, expected_title
+                ):
+                    self.logging_service.write(
+                        f"Stopping verification for "
+                        f"{current_folder.get('title')!r} because SharePoint "
+                        "rejected the rename. This folder will be skipped.",
+                        level=logging.WARNING,
+                    )
+                    return current_folder
+
+                current_folder = (
+                    self.get_folder_by_title(driver, expected_title) or current_folder
+                )
+
+            if missing_formats:
+                self.update_folder_formats(
+                    driver,
+                    wait,
+                    current_folder,
+                    sorted(missing_formats),
+                )
+                grid_view_open = True
+
+            for field_name, expected_value in mismatched_fields.items():
+                self.update_folder_text_field(
+                    driver,
+                    wait,
+                    current_folder,
+                    field_name,
+                    expected_value,
+                )
+                grid_view_open = True
+
+            if grid_view_open:
+                current_folder = exit_grid_view(current_folder)
 
     def update_folder_from_catalog(self, driver, wait, folder, catalog):
         isbn_13_value = catalog.get("isbn_13")
@@ -1050,15 +1661,16 @@ class TextbookCatalogingService:
             isbn = selected_isbn
 
         if not isbn:
-            # TODO: CHECK on GOOGLE API for ISBN-13.
             self.logging_service.write(
-                f"Catalog result returned no ISBN-13 for ISBN {selected_isbn!r}; "
-                "stopping before renaming or updating the folder. "
-                "TODO: CHECK on GOOGLE API for ISBN-13.",
+                f"Catalog lookup ISBN {selected_isbn!r} did not produce a valid "
+                f"ISBN-13 for folder {folder.get('title')!r}. "
+                f"Catalog title: {catalog.get('title') or catalog.get('full_title')!r}; "
+                f"catalog ISBN-13 values: {isbn_13_value!r}. "
+                "The folder will not be renamed or updated.",
                 level=logging.ERROR,
             )
             self._catalog_log_context = None
-            return
+            return False
 
         title = (
             catalog.get("title")
@@ -1075,6 +1687,23 @@ class TextbookCatalogingService:
         print("isbn", isbn)
         print("title", title)
 
+        # Preserve detected formats before the rename refreshes the SharePoint row.
+        formats_to_apply = []
+        for format_values in (
+            folder.get("format"),
+            folder.get("file_extensions"),
+        ):
+            if isinstance(format_values, str):
+                format_values = re.findall(r"[a-z0-9]+", format_values.casefold())
+            elif not isinstance(format_values, (list, tuple, set)):
+                format_values = [format_values] if format_values else []
+
+            for format_value in format_values:
+                extension = str(format_value or "").strip().casefold()
+                if extension and extension not in formats_to_apply:
+                    formats_to_apply.append(extension)
+
+        original_folder_title = folder["title"]
         self._catalog_log_context = {
             "isbn": isbn,
             "catalog_title": title,
@@ -1094,9 +1723,15 @@ class TextbookCatalogingService:
         }
 
         if isbn != folder["title"]:
-            self.rename_sharepoint_folder(driver, wait, folder, isbn)
+            if not self.rename_sharepoint_folder(driver, wait, folder, isbn):
+                self.logging_service.write(
+                    f"Skipping catalog updates for {folder['title']!r}; "
+                    f"SharePoint could not set the folder name to ISBN-13 {isbn!r}.",
+                    level=logging.WARNING,
+                )
+                self._catalog_log_context = None
+                return False
 
-        formats_to_apply = folder.get("format") or folder.get("file_extensions") or []
         self.logging_service.write(
             f"Applying detected formats for ISBN {isbn!r}: ",
             formats_to_apply,
@@ -1162,45 +1797,96 @@ class TextbookCatalogingService:
                 if str(publisher).strip()
             )
 
-        # Keep a valid title-derived edition ahead of catalog metadata.
+        # Edition is optional. Use a detected title edition or explicit catalog metadata.
         edition = (
             getattr(self, "_detected_edition", None)
             or catalog.get("edition_name")
             or catalog.get("edition")
         )
 
-        if not edition:
-            notes = catalog.get("notes")
-            if isinstance(notes, dict):
-                notes = notes.get("value", "")
-
-            edition_text = " ".join(
-                str(value or "")
-                for value in (
-                    notes,
-                    catalog.get("title"),
-                    catalog.get("full_title"),
-                    catalog.get("subtitle"),
-                )
-            )
-
-            match = re.search(
-                r"(?<![A-Za-z0-9])"
-                r"(?:(?P<shorthand>\d{1,2}\s*e)|"
-                r"(?P<ordinal>\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
-                r"[\s-]+(?:edition|ed\.?))"
-                r"(?![A-Za-z0-9])",
-                edition_text,
-                flags=re.IGNORECASE,
-            )
-            if match:
-                edition_marker = match.group("shorthand") or match.group("ordinal")
-                edition = re.sub(r"[\s-]+", "", edition_marker).casefold()
+        expected_fields = {
+            field_name: value
+            for field_name, value in {
+                "book_title": title,
+                "author": authors,
+                "publisher": publishers,
+                "edition": edition,
+            }.items()
+            if value is not None and str(value).strip()
+        }
 
         self.update_folder_text_field(driver, wait, folder, "book_title", title)
         self.update_folder_text_field(driver, wait, folder, "author", authors)
         self.update_folder_text_field(driver, wait, folder, "publisher", publishers)
         self.update_folder_text_field(driver, wait, folder, "edition", edition)
+
+        folder = self.get_folder_by_title(driver, folder["title"]) or folder
+        folder_title_element = folder["_elements"]["title"]
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            folder_title_element,
+        )
+        ActionChains(driver).move_to_element(folder_title_element).pause(0.3).perform()
+
+        folder_row = folder_title_element.find_element(
+            By.XPATH,
+            "./ancestor::*[@role='row'][1]",
+        )
+        more_actions = wait.until(
+            lambda d: next(
+                (
+                    button
+                    for button in folder_row.find_elements(
+                        By.CSS_SELECTOR,
+                        'button[data-automationid="moreActionsHeroField"]',
+                    )
+                    if button.is_displayed() and button.is_enabled()
+                ),
+                False,
+            )
+        )
+        driver.execute_script("arguments[0].click();", more_actions)
+
+        exit_grid_locator = (
+            By.CSS_SELECTOR,
+            'button[data-automationid="exitGridCommand"]',
+        )
+        exit_grid_button = wait.until(
+            EC.visibility_of_element_located(exit_grid_locator)
+        )
+        driver.execute_script("arguments[0].click();", exit_grid_button)
+        wait.until(EC.invisibility_of_element_located(exit_grid_locator))
+
+        self.logging_service.write(
+            f"Exited grid view for folder {isbn!r}; "
+            "continuing on the current listing."
+        )
+
+        try:
+            verified_folder = self.verify_folder_catalog_update(
+                driver,
+                wait,
+                original_folder_title,
+                isbn,
+                formats_to_apply,
+                expected_fields,
+                max_retries=2,
+            )
+            if verified_folder is None:
+                self._catalog_log_context = None
+                return False
+            folder.update(verified_folder)
+        except (TimeoutException, TimeoutError) as exc:
+            self.logging_service.write(
+                f"Catalog update verification failed for folder "
+                f"{original_folder_title!r} (ISBN {isbn!r}); continuing to the "
+                f"next folder. Error: {type(exc).__name__}: {exc}. "
+                f"Catalog context: {self._catalog_log_context!r}",
+                level=logging.ERROR,
+            )
+            self._catalog_log_context = None
+            return False
 
         updated_folder = self.get_folder_by_title(driver, folder["title"])
         if updated_folder:
@@ -1261,32 +1947,41 @@ class TextbookCatalogingService:
                 )
 
         self._catalog_log_context = None
+        return True
 
     def download_sharepoint_file(self, driver, wait, item):
+        download_wait = WebDriverWait(driver, 30)
         before = set(self.download_dir.iterdir())
         title_element = item["_elements"]["title"]
-        wait.until(EC.visibility_of(title_element))
+
+        download_wait.until(EC.visibility_of(title_element))
         driver.execute_script(
             "arguments[0].scrollIntoView({block: 'center'});", title_element
         )
         ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
-        row = title_element.find_element(By.XPATH, "./ancestor::*[@role='row'][1]")
-        more_actions = row.find_element(
-            By.CSS_SELECTOR, 'button[data-automationid="moreActionsHeroField"]'
+
+        row = title_element.find_element(
+            By.XPATH,
+            "./ancestor::*[@role='row'][1]",
         )
-        print("Clicking More Actions for:", item["title"])
-        print("more_actions", more_actions)
-        wait.until(EC.visibility_of(more_actions))
+        more_actions = row.find_element(
+            By.CSS_SELECTOR,
+            'button[data-automationid="moreActionsHeroField"]',
+        )
+
+        download_wait.until(EC.visibility_of(more_actions))
         driver.execute_script("arguments[0].click();", more_actions)
+
         download_button_locator = (
             By.CSS_SELECTOR,
             'button[data-automationid="downloadCommand"]',
         )
-        download_button = wait.until(
+        download_button = download_wait.until(
             EC.visibility_of_element_located(download_button_locator)
         )
         driver.execute_script("arguments[0].click();", download_button)
-        deadline = time.monotonic() + 90
+
+        deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             new_files = [
                 path
@@ -1301,10 +1996,16 @@ class TextbookCatalogingService:
                 for path in new_files
                 if not path.name.endswith((".crdownload", ".tmp"))
             ]
+
             if completed_files and not partial_download:
                 return max(completed_files, key=lambda path: path.stat().st_mtime)
+
             time.sleep(0.5)
-        raise TimeoutError("The SharePoint file did not finish downloading.")
+
+        raise TimeoutError(
+            f"SharePoint did not finish downloading {item['title']!r} "
+            "within 180 seconds."
+        )
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
         extension = file_path.suffix.casefold()
@@ -1405,25 +2106,6 @@ class TextbookCatalogingService:
             raise ValueError(f"Unsupported file type: {extension}")
 
         text = "\n".join(text_parts)
-
-        # Prefer title-derived editions; only scan downloaded text when none was found.
-        if not getattr(self, "_detected_edition", None):
-            match = re.search(
-                r"(?<![A-Za-z0-9])"
-                r"(?:(?P<shorthand>\d{1,2}\s*e)|"
-                r"(?P<ordinal>\d{1,2}\s*-?\s*(?:st|nd|rd|th))"
-                r"[\s-]+(?:edition|ed\.?))"
-                r"(?![A-Za-z0-9])",
-                text,
-                flags=re.IGNORECASE,
-            )
-            if match:
-                edition = match.group("shorthand") or match.group("ordinal")
-                self._detected_edition = re.sub(r"[\s-]+", "", edition).casefold()
-                self.logging_service.write(
-                    f"Found edition marker in downloaded text: "
-                    f"{self._detected_edition}"
-                )
 
         for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
             for match in pattern.finditer(text):
@@ -1528,7 +2210,7 @@ class TextbookCatalogingService:
 
             for attempt in range(1, self.MAX_FOLDERS_TO_RENAME + 1):
                 self.logging_service.write(
-                    f"Starting folder pass {attempt} of "
+                    f"\nStarting folder pass {attempt} of "
                     f"{self.MAX_FOLDERS_TO_RENAME}."
                 )
 
@@ -1584,9 +2266,7 @@ class TextbookCatalogingService:
                         book_folder.get("file_extensions") or []
                     )
                     original_title = parent_folder.get("title")
-
                     self.update_folder_from_catalog(driver, wait, parent_folder, result)
-                    # TODO: MAKE SURE NEW CELL UPDATES GET SAVED!!!!!!! REN
 
                     if parent_folder.get("title") == original_title:
                         self.skipped_folder_renames += 1
@@ -1600,6 +2280,8 @@ class TextbookCatalogingService:
                         f"{book_folder.get('title')!r}: no eligible catalog "
                         f"result or parent folder row."
                     )
+                # NOTE: pause after each folder
+                # input("\nPress Enter to continue...")
 
         except (TimeoutException, TimeoutError) as exc:
             catalog_context = getattr(self, "_catalog_log_context", None)
@@ -1610,7 +2292,7 @@ class TextbookCatalogingService:
                     level=logging.ERROR,
                 )
             self.logging_service.write(
-                f"\nTimed out waiting for SharePoint: {exc}",
+                f"\nTimed out waiting for SharePoint: \n{exc}",
                 level=logging.ERROR,
             )
             self.logging_service.write("Closing Edge and stopping the script.")
