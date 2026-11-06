@@ -719,6 +719,7 @@ class TextbookCatalogingService:
             return None
 
         matter_type = "end" if is_end_matter(matter_file) else "front"
+        downloaded_path = None
 
         try:
             for folder_title in matter_path:
@@ -774,11 +775,24 @@ class TextbookCatalogingService:
                 f"and continuing. Error: {type(exc).__name__}: {exc}"
             )
             return None
+        finally:
+            if downloaded_path is not None and downloaded_path.is_file():
+                try:
+                    downloaded_path.unlink()
+                    self.logging_service.write(
+                        f"Deleted temporary downloaded file: {downloaded_path}"
+                    )
+                except OSError as cleanup_error:
+                    self.logging_service.write(
+                        f"Could not delete temporary downloaded file "
+                        f"{downloaded_path}: {cleanup_error}",
+                        level=logging.WARNING,
+                    )
 
         if downloaded_isbn and len(downloaded_isbn) == 13:
             isbn = downloaded_isbn
             self.logging_service.write(
-                f"Found ISBN-13 in downloaded file " f"{matter_file['title']!r}: {isbn}"
+                f"Found ISBN-13 in downloaded file {matter_file['title']!r}: {isbn}"
             )
         elif isbn_10_candidates:
             isbn = isbn_10_candidates[0]
@@ -788,7 +802,7 @@ class TextbookCatalogingService:
         elif downloaded_isbn:
             isbn = downloaded_isbn
             self.logging_service.write(
-                f"Found ISBN-10 in downloaded file " f"{matter_file['title']!r}: {isbn}"
+                f"Found ISBN-10 in downloaded file {matter_file['title']!r}: {isbn}"
             )
         else:
             self.logging_service.write(
@@ -803,9 +817,27 @@ class TextbookCatalogingService:
 
     def open_folder(self, driver, wait, folder):
         old_row = folder["_elements"]["row"]
+        title_element = folder["_elements"]["title"]
         old_url = driver.current_url
         old_signature = self.get_listing_signature(driver)
-        wait.until(EC.element_to_be_clickable(folder["_elements"]["title"])).click()
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            title_element,
+        )
+        wait.until(EC.element_to_be_clickable(title_element))
+
+        try:
+            title_element.click()
+        except ElementClickInterceptedException:
+            self.logging_service.write(
+                f"Folder title click was intercepted for {folder.get('title')!r}; "
+                "retrying with a DOM click because a SharePoint header or "
+                "overlay covered the title.",
+                level=logging.WARNING,
+            )
+            driver.execute_script("arguments[0].click();", title_element)
+
         wait.until(EC.any_of(EC.staleness_of(old_row), EC.url_changes(old_url)))
         self.wait_for_folder_listing(driver, previous_signature=old_signature)
 
@@ -1346,8 +1378,8 @@ class TextbookCatalogingService:
             "pdf": "pdf",
             "epub": "epub",
             "docx": "docx",
-            "doc": "doc",
-            "word": "doc",
+            "doc": "docx",
+            "word": "docx",
             "tif": "tif",
             "tiff": "tif",
         }
@@ -1409,6 +1441,51 @@ class TextbookCatalogingService:
                 )
             except StaleElementReferenceException:
                 return False
+
+        def exit_grid_view(current_folder):
+            current_folder = (
+                self.get_folder_by_title(driver, expected_title) or current_folder
+            )
+            title_element = current_folder["_elements"]["title"]
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});",
+                title_element,
+            )
+            ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
+
+            folder_row = title_element.find_element(
+                By.XPATH,
+                "./ancestor::*[@role='row'][1]",
+            )
+            more_actions = wait.until(
+                lambda d: next(
+                    (
+                        button
+                        for button in folder_row.find_elements(
+                            By.CSS_SELECTOR,
+                            'button[data-automationid="moreActionsHeroField"]',
+                        )
+                        if button.is_displayed() and button.is_enabled()
+                    ),
+                    False,
+                )
+            )
+            driver.execute_script("arguments[0].click();", more_actions)
+
+            exit_grid_locator = (
+                By.CSS_SELECTOR,
+                'button[data-automationid="exitGridCommand"]',
+            )
+            exit_grid_button = wait.until(
+                EC.visibility_of_element_located(exit_grid_locator)
+            )
+            driver.execute_script("arguments[0].click();", exit_grid_button)
+            wait.until(EC.invisibility_of_element_located(exit_grid_locator))
+            self.logging_service.write(
+                f"Exited grid view after retrying catalog values for "
+                f"{expected_title!r}."
+            )
+            return self.get_folder_by_title(driver, expected_title) or current_folder
 
         def reload_and_read_folder():
             try:
@@ -1479,6 +1556,7 @@ class TextbookCatalogingService:
             )
             actual_formats = normalized_formats(current_folder.get("format"))
             missing_formats = expected_format_set - actual_formats
+            grid_view_open = False
 
             if not title_mismatch and not mismatched_fields and not missing_formats:
                 self.logging_service.write(
@@ -1537,6 +1615,7 @@ class TextbookCatalogingService:
                     current_folder,
                     sorted(missing_formats),
                 )
+                grid_view_open = True
 
             for field_name, expected_value in mismatched_fields.items():
                 self.update_folder_text_field(
@@ -1546,6 +1625,10 @@ class TextbookCatalogingService:
                     field_name,
                     expected_value,
                 )
+                grid_view_open = True
+
+            if grid_view_open:
+                current_folder = exit_grid_view(current_folder)
 
     def update_folder_from_catalog(self, driver, wait, folder, catalog):
         isbn_13_value = catalog.get("isbn_13")
@@ -1780,6 +1863,28 @@ class TextbookCatalogingService:
             "continuing on the current listing."
         )
 
+        try:
+            verified_folder = self.verify_folder_catalog_update(
+                driver,
+                wait,
+                original_folder_title,
+                isbn,
+                formats_to_apply,
+                expected_fields,
+                max_retries=2,
+            )
+            folder.update(verified_folder)
+        except (TimeoutException, TimeoutError) as exc:
+            self.logging_service.write(
+                f"Catalog update verification failed for folder "
+                f"{original_folder_title!r} (ISBN {isbn!r}); continuing to the "
+                f"next folder. Error: {type(exc).__name__}: {exc}. "
+                f"Catalog context: {self._catalog_log_context!r}",
+                level=logging.ERROR,
+            )
+            self._catalog_log_context = None
+            return False
+
         updated_folder = self.get_folder_by_title(driver, folder["title"])
         if updated_folder:
             folder.update(updated_folder)
@@ -1839,6 +1944,7 @@ class TextbookCatalogingService:
                 )
 
         self._catalog_log_context = None
+        return True
 
     def download_sharepoint_file(self, driver, wait, item):
         download_wait = WebDriverWait(driver, 30)
