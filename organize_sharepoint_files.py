@@ -2,6 +2,8 @@ from utils.logging_service import LogService
 from utils.api_service import ApiService
 from config import SID
 import time
+import shutil
+import tempfile
 from datetime import datetime
 import ctypes
 import os
@@ -776,9 +778,9 @@ class TextbookCatalogingService:
             )
             return None
         finally:
-            if downloaded_path is not None and downloaded_path.is_file():
+            if downloaded_path is not None:
                 try:
-                    downloaded_path.unlink()
+                    shutil.rmtree(downloaded_path.parent)
                     self.logging_service.write(
                         f"Deleted temporary downloaded file: {downloaded_path}"
                     )
@@ -1602,7 +1604,7 @@ class TextbookCatalogingService:
                         "rejected the rename. This folder will be skipped.",
                         level=logging.WARNING,
                     )
-                    return current_folder
+                    return None
 
                 current_folder = (
                     self.get_folder_by_title(driver, expected_title) or current_folder
@@ -1950,62 +1952,74 @@ class TextbookCatalogingService:
         return True
 
     def download_sharepoint_file(self, driver, wait, item):
-        download_wait = WebDriverWait(driver, 30)
-        before = set(self.download_dir.iterdir())
-        title_element = item["_elements"]["title"]
-
-        download_wait.until(EC.visibility_of(title_element))
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", title_element
-        )
-        ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
-
-        row = title_element.find_element(
-            By.XPATH,
-            "./ancestor::*[@role='row'][1]",
-        )
-        more_actions = row.find_element(
-            By.CSS_SELECTOR,
-            'button[data-automationid="moreActionsHeroField"]',
-        )
-
-        download_wait.until(EC.visibility_of(more_actions))
-        driver.execute_script("arguments[0].click();", more_actions)
-
-        download_button_locator = (
-            By.CSS_SELECTOR,
-            'button[data-automationid="downloadCommand"]',
-        )
-        download_button = download_wait.until(
-            EC.visibility_of_element_located(download_button_locator)
-        )
-        driver.execute_script("arguments[0].click();", download_button)
-
-        deadline = time.monotonic() + 180
-        while time.monotonic() < deadline:
-            new_files = [
-                path
-                for path in self.download_dir.iterdir()
-                if path not in before and path.is_file()
-            ]
-            partial_download = any(
-                path.name.endswith((".crdownload", ".tmp")) for path in new_files
+        download_dir = Path(tempfile.mkdtemp(prefix="sharepoint-", dir=self.download_dir))
+        downloaded_path = None
+        try:
+            driver.execute_cdp_cmd(
+                "Browser.setDownloadBehavior",
+                {"behavior": "allow", "downloadPath": str(download_dir.resolve())},
             )
-            completed_files = [
-                path
-                for path in new_files
-                if not path.name.endswith((".crdownload", ".tmp"))
-            ]
+            download_wait = WebDriverWait(driver, 30)
+            title_element = item["_elements"]["title"]
 
-            if completed_files and not partial_download:
-                return max(completed_files, key=lambda path: path.stat().st_mtime)
+            download_wait.until(EC.visibility_of(title_element))
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", title_element
+            )
+            ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
 
-            time.sleep(0.5)
+            row = title_element.find_element(
+                By.XPATH,
+                "./ancestor::*[@role='row'][1]",
+            )
+            more_actions = row.find_element(
+                By.CSS_SELECTOR,
+                'button[data-automationid="moreActionsHeroField"]',
+            )
 
-        raise TimeoutError(
-            f"SharePoint did not finish downloading {item['title']!r} "
-            "within 180 seconds."
-        )
+            download_wait.until(EC.visibility_of(more_actions))
+            driver.execute_script("arguments[0].click();", more_actions)
+
+            download_button_locator = (
+                By.CSS_SELECTOR,
+                'button[data-automationid="downloadCommand"]',
+            )
+            download_button = download_wait.until(
+                EC.visibility_of_element_located(download_button_locator)
+            )
+            driver.execute_script("arguments[0].click();", download_button)
+
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                new_files = [
+                    path
+                    for path in download_dir.iterdir()
+                    if path.is_file()
+                ]
+                partial_download = any(
+                    path.name.endswith((".crdownload", ".tmp")) for path in new_files
+                )
+                completed_files = [
+                    path
+                    for path in new_files
+                    if not path.name.endswith((".crdownload", ".tmp"))
+                ]
+
+                if completed_files and not partial_download:
+                    downloaded_path = max(
+                        completed_files, key=lambda path: path.stat().st_mtime
+                    )
+                    return downloaded_path
+
+                time.sleep(0.5)
+
+            raise TimeoutError(
+                f"SharePoint did not finish downloading {item['title']!r} "
+                "within 180 seconds."
+            )
+        finally:
+            if downloaded_path is None:
+                shutil.rmtree(download_dir)
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
         extension = file_path.suffix.casefold()
@@ -2266,7 +2280,12 @@ class TextbookCatalogingService:
                         book_folder.get("file_extensions") or []
                     )
                     original_title = parent_folder.get("title")
-                    self.update_folder_from_catalog(driver, wait, parent_folder, result)
+                    if not self.update_folder_from_catalog(
+                        driver, wait, parent_folder, result
+                    ):
+                        processed_titles.add(
+                            str(parent_folder.get("title") or "").casefold()
+                        )
 
                     if parent_folder.get("title") == original_title:
                         self.skipped_folder_renames += 1
