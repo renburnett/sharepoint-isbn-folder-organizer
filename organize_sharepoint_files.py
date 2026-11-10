@@ -1,6 +1,5 @@
 from utils.logging_service import LogService
 from utils.api_service import ApiService
-from config import SID
 import time
 from datetime import datetime
 import ctypes
@@ -28,6 +27,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoAlertPresentException,
     UnexpectedAlertPresentException,
+    WebDriverException,
 )
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -48,7 +48,7 @@ class TextbookCatalogingService:
     ISBN_13_PATTERN = re.compile(r"(?<!\d)97[89](?:[^\dA-Za-z]?\d){10}(?!\d)")
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
-    MAX_PAGES_TO_SCAN = 8
+    MAX_DOWNLOADED_PAGES_TO_SCAN = 8
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -66,7 +66,7 @@ class TextbookCatalogingService:
 
         return tuple(names)
 
-    def wait_for_folder_listing(self, driver, previous_signature=None, timeout=10):
+    def wait_for_folder_listing(self, driver, previous_signature=None, timeout=13):
         deadline = time.monotonic() + timeout
         last_signature = None
         stable_since = None
@@ -708,8 +708,7 @@ class TextbookCatalogingService:
                 return lookup_catalog(isbn)
 
             self.logging_service.write(
-                "No ISBN-13 or ISBN-10 was found. "
-                "TODO: CHECK on GOOGLE API for ISBN-13.",
+                "No ISBN-13 or ISBN-10 was found. ",
                 level=logging.WARNING,
             )
             return None
@@ -803,13 +802,112 @@ class TextbookCatalogingService:
         else:
             self.logging_service.write(
                 f"No ISBN-13 or ISBN-10 was found in the downloaded file "
-                f"{matter_file['title']!r}. "
-                "TODO: CHECK on GOOGLE API for ISBN-13.",
+                f"{matter_file['title']!r}. ",
                 level=logging.WARNING,
             )
             return None
 
         return lookup_catalog(isbn)
+
+    def enter_grid_view(self, driver, wait, folder_title):
+        def find_edit_grid_button(driver):
+            candidates = driver.find_elements(
+                By.CSS_SELECTOR,
+                'button, [role="button"], [role="menuitem"]',
+            )
+            for candidate in candidates:
+                if not candidate.is_displayed() or not candidate.is_enabled():
+                    continue
+
+                labels = (
+                    candidate.get_attribute("data-automationid"),
+                    candidate.get_attribute("aria-label"),
+                    candidate.get_attribute("title"),
+                    candidate.text,
+                )
+                if any(
+                    "edit in grid view" in " ".join(str(label or "").split()).casefold()
+                    or str(label or "").casefold() == "editInGridViewCommand".casefold()
+                    for label in labels
+                ):
+                    return candidate
+
+            return False
+
+        try:
+            grid_view_deadline = time.monotonic() + 10
+
+            def wait_for_grid_action(condition):
+                remaining = grid_view_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutException(
+                        "Timed out locating the Edit in grid view command."
+                    )
+                return WebDriverWait(driver, remaining).until(condition)
+
+            target_folder = self.get_folder_by_title(driver, folder_title)
+            if not target_folder:
+                raise TimeoutException(
+                    f"Could not find renamed folder {folder_title!r} in the listing."
+                )
+
+            # The command may be exposed only in the target row's More Actions menu.
+            edit_button = find_edit_grid_button(driver)
+            if not edit_button:
+                title_element = target_folder["_elements"]["title"]
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});",
+                    title_element,
+                )
+                ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
+
+                folder_row = title_element.find_element(
+                    By.XPATH,
+                    "./ancestor::*[@role='row'][1]",
+                )
+                more_actions = wait_for_grid_action(
+                    lambda d: next(
+                        (
+                            button
+                            for button in folder_row.find_elements(
+                                By.CSS_SELECTOR,
+                                'button[data-automationid="moreActionsHeroField"]',
+                            )
+                            if button.is_displayed() and button.is_enabled()
+                        ),
+                        False,
+                    )
+                )
+                driver.execute_script("arguments[0].click();", more_actions)
+                edit_button = wait_for_grid_action(find_edit_grid_button)
+
+            driver.execute_script("arguments[0].click();", edit_button)
+            wait_for_grid_action(
+                lambda d: self.get_folder_by_title(d, folder_title) is not None
+            )
+            self.logging_service.write(
+                f"Re-entered grid view for folder {folder_title!r} "
+                "after saving its ISBN rename."
+            )
+            return True
+
+        except (
+            TimeoutException,
+            StaleElementReferenceException,
+            WebDriverException,
+        ) as exc:
+            try:
+                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except WebDriverException:
+                pass
+
+            self.logging_service.write(
+                f"Could not re-enter grid view for folder {folder_title!r} "
+                f"after saving its ISBN rename: {type(exc).__name__}: {exc}. "
+                "Skipping its catalog-cell updates.",
+                level=logging.ERROR,
+            )
+            return False
 
     def open_folder(self, driver, wait, folder):
         old_row = folder["_elements"]["row"]
@@ -993,10 +1091,29 @@ class TextbookCatalogingService:
             None,
         )
 
-    def rename_sharepoint_folder(self, driver, wait, folder, new_title):
+    def rename_sharepoint_folder(
+        self,
+        driver,
+        wait,
+        folder,
+        new_title,
+        allow_duplicate=True,
+        is_rollback=False,
+        original_title=None,
+        ignored_messages=(),
+    ):
         old_title = folder["title"]
+        original_title = original_title or old_title
+        ignored_messages = {str(message).casefold() for message in ignored_messages}
+
+        # SharePoint can take a while to submit a rename after leaving grid view.
+        rename_wait = WebDriverWait(driver, 60)
         original_url = driver.current_url
         original_signature = self.get_listing_signature(driver)
+
+        refreshed_folder = self.get_folder_by_title(driver, old_title)
+        if refreshed_folder:
+            folder.update(refreshed_folder)
         row_ref = [folder["_elements"]["row"]]
 
         editor_selectors = (
@@ -1091,7 +1208,7 @@ class TextbookCatalogingService:
                 By.XPATH,
                 "./ancestor::*[@role='row'][1]",
             )
-            more_actions = wait.until(
+            more_actions = rename_wait.until(
                 lambda d: next(
                     (
                         button
@@ -1110,11 +1227,11 @@ class TextbookCatalogingService:
                 By.CSS_SELECTOR,
                 'button[data-automationid="exitGridCommand"]',
             )
-            exit_grid_button = wait.until(
+            exit_grid_button = rename_wait.until(
                 EC.visibility_of_element_located(exit_grid_locator)
             )
             driver.execute_script("arguments[0].click();", exit_grid_button)
-            wait.until(EC.invisibility_of_element_located(exit_grid_locator))
+            rename_wait.until(EC.invisibility_of_element_located(exit_grid_locator))
 
             self.logging_service.write(
                 f"Exited grid view to save ISBN folder rename "
@@ -1136,7 +1253,9 @@ class TextbookCatalogingService:
         error_message_locator = (
             By.CSS_SELECTOR,
             '[data-automationid="list-info-callout-container"] '
-            '[data-automationid="AsReactChildren"]',
+            '[data-automationid="AsReactChildren"], '
+            '[class*="errorCallout"] [data-automationid="AsReactChildren"], '
+            '[role="alert"]',
         )
 
         def rename_result(driver):
@@ -1148,14 +1267,18 @@ class TextbookCatalogingService:
                     message = (message_element.text or "").strip()
                     if message:
                         message_lower = message.casefold()
+                        if message_lower in ignored_messages:
+                            continue
                         if (
                             "already exists" in message_lower
-                            or "cannot rename" in message_lower
+                            or "duplicate" in message_lower
                         ):
                             return "collision", message
                         return "error", message
 
                 current_titles = self.get_listing_signature(driver)
+                if old_title == new_title and new_title in current_titles:
+                    return "renamed", None
                 if old_title not in current_titles and new_title in current_titles:
                     return "renamed", None
 
@@ -1164,7 +1287,7 @@ class TextbookCatalogingService:
                 return False
 
         try:
-            result, message = wait.until(rename_result)
+            result, message = rename_wait.until(rename_result)
         except TimeoutException as exc:
             self.logging_service.write(
                 f"SharePoint did not confirm the folder rename from "
@@ -1193,6 +1316,62 @@ class TextbookCatalogingService:
                 ActionChains(driver).send_keys(Keys.ESCAPE).perform()
             except WebDriverException:
                 pass
+
+            ignored_messages.add(str(message or "").casefold())
+
+            if (
+                result == "collision"
+                and allow_duplicate
+                and not new_title.casefold().endswith("-duplicate")
+            ):
+                duplicate_title = f"{new_title}-DUPLICATE"
+                self.logging_service.write(
+                    f"Retrying the folder rename with duplicate title "
+                    f"{duplicate_title!r}.",
+                    level=logging.WARNING,
+                )
+                retry_folder = self.get_folder_by_title(driver, old_title) or folder
+                return self.rename_sharepoint_folder(
+                    driver,
+                    wait,
+                    retry_folder,
+                    duplicate_title,
+                    allow_duplicate=False,
+                    is_rollback=False,
+                    original_title=original_title,
+                    ignored_messages=ignored_messages,
+                )
+
+            if not is_rollback:
+                self.logging_service.write(
+                    f"Restoring folder title to its original value "
+                    f"{original_title!r} after the rename error.",
+                    level=logging.WARNING,
+                )
+                rollback_folder = self.get_folder_by_title(driver, old_title) or folder
+                restored = self.rename_sharepoint_folder(
+                    driver,
+                    wait,
+                    rollback_folder,
+                    original_title,
+                    allow_duplicate=False,
+                    is_rollback=True,
+                    original_title=original_title,
+                    ignored_messages=ignored_messages,
+                )
+                if restored:
+                    self.logging_service.write(
+                        f"Restored original folder title {original_title!r}; "
+                        "skipping this folder's catalog updates."
+                    )
+                else:
+                    self.logging_service.write(
+                        f"Could not confirm restoration of original folder title "
+                        f"{original_title!r}.",
+                        level=logging.ERROR,
+                    )
+                return False
+
             return False
 
         folder["title"] = new_title
@@ -1819,15 +1998,43 @@ class TextbookCatalogingService:
                 self._catalog_log_context = None
                 return False
 
+            # The rename function exits grid view to submit and check the ISBN.
+            # Re-enter grid view on the same renamed folder before editing metadata.
+            if not self.enter_grid_view(driver, wait, folder["title"]):
+                self._catalog_log_context = None
+                return False
+
+        expected_folder_title = folder.get("title") or isbn
+
+        def attempt_cell_update(label, update):
+            try:
+                update()
+                return True
+            except (TimeoutException, TimeoutError, WebDriverException) as exc:
+                message = (
+                    f"Could not update {label} for folder {folder.get('title')!r} "
+                    f"(ISBN {isbn!r}): {type(exc).__name__}: {exc}. "
+                    "Continuing with the remaining cells."
+                )
+                self.logging_service.write(message, level=logging.ERROR)
+                try:
+                    ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                except WebDriverException:
+                    pass
+                return False
+
         self.logging_service.write(
             f"Applying detected formats for ISBN {isbn!r}: ",
             formats_to_apply,
         )
-        self.update_folder_formats(
-            driver,
-            wait,
-            folder,
-            formats_to_apply,
+        attempt_cell_update(
+            "Formats",
+            lambda: self.update_folder_formats(
+                driver,
+                wait,
+                folder,
+                formats_to_apply,
+            ),
         )
 
         author_entries = catalog.get("authors") or []
@@ -1910,11 +2117,23 @@ class TextbookCatalogingService:
             if value is not None and str(value).strip()
         }
 
-        self.update_folder_text_field(driver, wait, folder, "book_title", title)
-        self.update_folder_text_field(driver, wait, folder, "author", authors)
-        self.update_folder_text_field(driver, wait, folder, "publisher", publishers)
-        self.update_folder_text_field(driver, wait, folder, "edition", edition)
+        for field_name, value in (
+            ("book_title", title),
+            ("author", authors),
+            ("publisher", publishers),
+            ("edition", edition),
+        ):
+            if value:
+                attempt_cell_update(
+                    field_name,
+                    lambda field_name=field_name, value=value: (
+                        self.update_folder_text_field(
+                            driver, wait, folder, field_name, value
+                        )
+                    ),
+                )
 
+        # Submit the metadata edits by exiting grid view again after the last cell.
         folder = self.get_folder_by_title(driver, folder["title"]) or folder
         folder_title_element = folder["_elements"]["title"]
 
@@ -1963,7 +2182,7 @@ class TextbookCatalogingService:
                 driver,
                 wait,
                 original_folder_title,
-                isbn,
+                expected_folder_title,
                 formats_to_apply,
                 expected_fields,
                 max_retries=2,
@@ -2130,7 +2349,7 @@ class TextbookCatalogingService:
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
         extension = file_path.suffix.casefold()
-        max_pages_to_scan = getattr(self, "MAX_PAGES_TO_SCAN", 8)
+        max_pages_to_scan = getattr(self, "MAX_DOWNLOADED_PAGES_TO_SCAN", 8)
         text_parts = []
 
         if extension == ".pdf":
@@ -2423,8 +2642,14 @@ class TextbookCatalogingService:
                     f"details: {catalog_context!r}",
                     level=logging.ERROR,
                 )
+            timeout_detail = str(exc).strip()
+            if not timeout_detail:
+                timeout_detail = (
+                    "The Selenium wait expired without providing more details."
+                )
             self.logging_service.write(
-                f"\nTimed out waiting for SharePoint: \n{exc}",
+                f"Timed out waiting for SharePoint "
+                f"({type(exc).__name__}): {timeout_detail}",
                 level=logging.ERROR,
             )
             self.logging_service.write("Closing Edge and stopping the script.")
@@ -2465,48 +2690,43 @@ class TextbookCatalogingService:
                     level=logging.WARNING,
                 )
 
-    def main():
-        parser = argparse.ArgumentParser(
-            description="Catalog textbook folders in SharePoint."
-        )
-        parser.add_argument(
-            "--sid",
-            required=True,
-            help="Windows user-folder name used to locate Tesseract.",
-        )
-        parser.add_argument(
-            "--google-books-fallback",
-            action="store_true",
-            help="Try Google Books if Open Library does not find a record.",
-        )
-        parser.add_argument(
-            "--max-folders-to-rename",
-            type=int,
-            default=30,
-            help="Maximum folders to process (default 30; values above 30 are capped).",
-        )
-        args = parser.parse_args()
 
-        sid = args.sid.strip()
-        if not sid or Path(sid).name != sid:
-            parser.error(
-                "--sid must be your Windows user-folder name, not a full path."
-            )
+def main():
+    parser = argparse.ArgumentParser(
+        description="Catalog textbook folders in SharePoint."
+    )
+    parser.add_argument(
+        "--sid",
+        required=True,
+        help="Windows user-folder name used to locate Tesseract.",
+    )
+    parser.add_argument(
+        "--google-books-fallback",
+        action="store_true",
+        help="Try Google Books if Open Library does not find a record.",
+    )
+    parser.add_argument(
+        "--max-folders-to-rename",
+        type=int,
+        default=50,
+        help="Maximum folders to process (default 50; values above 50 are capped).",
+    )
+    args = parser.parse_args()
 
-        pytesseract.pytesseract.tesseract_cmd = str(
-            Path("C:/Users")
-            / sid
-            / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
-        )
-        TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(
-            1, min(args.max_folders_to_rename, 50)
-        )
-        ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = args.google_books_fallback
-        TextbookCatalogingService()
+    SID = args.sid.strip()
+    if not SID or Path(SID).name != SID:
+        parser.error("--SID must be your Windows user-folder name e.g. 006888191SA")
 
-    if __name__ == "__main__":
-        main()
+    pytesseract.pytesseract.tesseract_cmd = str(
+        Path("C:/Users") / SID / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
+    )
+    TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(
+        1, min(args.max_folders_to_rename, 50)
+    )
+    ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = args.google_books_fallback
+    TextbookCatalogingService()
 
 
 if __name__ == "__main__":
+    main()
     TextbookCatalogingService()

@@ -125,9 +125,14 @@ class ApiService:
                 if attempt == max_attempts:
                     break
 
-            retry_delay = 1 ** (attempt - 1)
+            retry_delay = 2 ** (attempt - 1)
             with self._spinner(f"Waiting {retry_delay} second(s) before retry"):
                 time.sleep(retry_delay)
+
+        # TODO: implement Google Books fallback lookup if Open Library fails
+        if self.GOOGLE_BOOKS_FALLBACK_ENABLED:
+            return None
+        # END TODO
 
         if not self.GOOGLE_BOOKS_FALLBACK_ENABLED:
             return None
