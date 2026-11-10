@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import re
 import time
 import requests
@@ -5,7 +6,7 @@ import logging
 
 
 class ApiService:
-    API_TIMEOUT = (5, 10)
+    API_TIMEOUT = (7, 13)
     # TODO: set this to True once authentication and response schema are set up and handled
     GOOGLE_BOOKS_FALLBACK_ENABLED = False
 
@@ -13,6 +14,11 @@ class ApiService:
         self.minimum_interval = minimum_interval
         self.logging_service = logging_service
         self.last_request_at = None
+
+    def _spinner(self, message):
+        if self.logging_service and hasattr(self.logging_service, "spinner"):
+            return self.logging_service.spinner(message)
+        return nullcontext()
 
     def wait(self):
         if self.last_request_at is not None:
@@ -23,36 +29,43 @@ class ApiService:
                     self.logging_service.write(
                         f"API rate limit: waiting {delay:.1f} seconds."
                     )
-                time.sleep(delay)
+                with self._spinner("Waiting for API rate limit"):
+                    time.sleep(delay)
 
         self.last_request_at = time.monotonic()
 
     def lookup_author(self, author_key):
         match = re.fullmatch(r"/?authors/(OL\d+A)", str(author_key or "").strip())
         if not match:
-            self.logging_service.write(
-                f"Invalid Open Library author key: {author_key!r}",
-                level=logging.WARNING,
-            )
+            if self.logging_service:
+                self.logging_service.write(
+                    f"Invalid Open Library author key: {author_key!r}",
+                    level=logging.WARNING,
+                )
             return None
 
         url = f"https://openlibrary.org/authors/{match.group(1)}.json"
         try:
             self.wait()
-            response = requests.get(url, timeout=self.API_TIMEOUT)
+            with self._spinner("Looking up author in Open Library"):
+                response = requests.get(url, timeout=self.API_TIMEOUT)
+
             if response.status_code == 404:
-                self.logging_service.write(
-                    f"Open Library author record not found: {author_key}",
-                    level=logging.WARNING,
-                )
+                if self.logging_service:
+                    self.logging_service.write(
+                        f"Open Library author record not found: {author_key}",
+                        level=logging.WARNING,
+                    )
                 return None
+
             response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:
-            self.logging_service.write(
-                f"Open Library author lookup failed for {author_key}: {exc}",
-                level=logging.WARNING,
-            )
+            if self.logging_service:
+                self.logging_service.write(
+                    f"Open Library author lookup failed for {author_key}: {exc}",
+                    level=logging.WARNING,
+                )
             return None
 
     def lookup_isbn(self, isbn):
@@ -68,7 +81,10 @@ class ApiService:
         for attempt in range(1, max_attempts + 1):
             try:
                 self.wait()
-                response = requests.get(url, timeout=self.API_TIMEOUT)
+                with self._spinner(
+                    f"Looking up ISBN in Open Library ({attempt}/{max_attempts})"
+                ):
+                    response = requests.get(url, timeout=self.API_TIMEOUT)
 
                 if response.status_code == 404:
                     log(
@@ -109,7 +125,14 @@ class ApiService:
                 if attempt == max_attempts:
                     break
 
-            time.sleep(2 ** (attempt - 1))
+            retry_delay = 2 ** (attempt - 1)
+            with self._spinner(f"Waiting {retry_delay} second(s) before retry"):
+                time.sleep(retry_delay)
+
+        # TODO: implement Google Books fallback lookup if Open Library fails
+        if self.GOOGLE_BOOKS_FALLBACK_ENABLED:
+            return None
+        # END TODO
 
         if not self.GOOGLE_BOOKS_FALLBACK_ENABLED:
             return None
@@ -117,11 +140,13 @@ class ApiService:
         log(f"Trying Google Books for ISBN {isbn}.")
 
         try:
-            response = requests.get(
-                "https://www.googleapis.com/books/v1/volumes",
-                params={"q": f"isbn:{isbn}", "maxResults": 1},
-                timeout=self.API_TIMEOUT,
-            )
+            with self._spinner("Looking up ISBN in Google Books"):
+                response = requests.get(
+                    "https://www.googleapis.com/books/v1/volumes",
+                    params={"q": f"isbn:{isbn}", "maxResults": 1},
+                    timeout=self.API_TIMEOUT,
+                )
+
             response.raise_for_status()
             data = response.json()
 
