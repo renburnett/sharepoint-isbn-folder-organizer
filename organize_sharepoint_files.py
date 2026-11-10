@@ -10,11 +10,8 @@ from pathlib import Path
 import ebooklib
 import pymupdf
 import logging
+import argparse
 import pytesseract
-
-pytesseract.pytesseract.tesseract_cmd = (
-    rf"C:\Users\{SID}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-)
 from bs4 import BeautifulSoup
 from docx import Document
 from ebooklib import epub
@@ -52,7 +49,6 @@ class TextbookCatalogingService:
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
     MAX_PAGES_TO_SCAN = 8
-    MAX_FOLDERS_TO_RENAME = 12
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -1074,6 +1070,69 @@ class TextbookCatalogingService:
         editor.send_keys(new_title)
         editor.send_keys(Keys.ENTER)
 
+        # Exit grid view to submit the ISBN rename before editing other cells.
+        try:
+            # Prefer the source row because the destination folder may already exist.
+            current_folder = self.get_folder_by_title(
+                driver, old_title
+            ) or self.get_folder_by_title(driver, new_title)
+            if current_folder:
+                folder.update(current_folder)
+                row_ref[0] = folder["_elements"]["row"]
+
+            title_element = folder["_elements"]["title"]
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});",
+                title_element,
+            )
+            ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
+
+            folder_row = title_element.find_element(
+                By.XPATH,
+                "./ancestor::*[@role='row'][1]",
+            )
+            more_actions = wait.until(
+                lambda d: next(
+                    (
+                        button
+                        for button in folder_row.find_elements(
+                            By.CSS_SELECTOR,
+                            'button[data-automationid="moreActionsHeroField"]',
+                        )
+                        if button.is_displayed() and button.is_enabled()
+                    ),
+                    False,
+                )
+            )
+            driver.execute_script("arguments[0].click();", more_actions)
+
+            exit_grid_locator = (
+                By.CSS_SELECTOR,
+                'button[data-automationid="exitGridCommand"]',
+            )
+            exit_grid_button = wait.until(
+                EC.visibility_of_element_located(exit_grid_locator)
+            )
+            driver.execute_script("arguments[0].click();", exit_grid_button)
+            wait.until(EC.invisibility_of_element_located(exit_grid_locator))
+
+            self.logging_service.write(
+                f"Exited grid view to save ISBN folder rename "
+                f"from {old_title!r} to {new_title!r}."
+            )
+        except (TimeoutException, StaleElementReferenceException) as exc:
+            self.logging_service.write(
+                f"Could not submit the ISBN folder rename for {old_title!r} "
+                f"to {new_title!r} by exiting grid view: "
+                f"{type(exc).__name__}: {exc}. Skipping this folder.",
+                level=logging.ERROR,
+            )
+            try:
+                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except WebDriverException:
+                pass
+            return False
+
         error_message_locator = (
             By.CSS_SELECTOR,
             '[data-automationid="list-info-callout-container"] '
@@ -1081,32 +1140,59 @@ class TextbookCatalogingService:
         )
 
         def rename_result(driver):
-            for message_element in driver.find_elements(*error_message_locator):
-                if not message_element.is_displayed():
-                    continue
+            try:
+                for message_element in driver.find_elements(*error_message_locator):
+                    if not message_element.is_displayed():
+                        continue
 
-                message = (message_element.text or "").strip()
-                if message:
-                    return "error", message
+                    message = (message_element.text or "").strip()
+                    if message:
+                        message_lower = message.casefold()
+                        if (
+                            "already exists" in message_lower
+                            or "cannot rename" in message_lower
+                        ):
+                            return "collision", message
+                        return "error", message
 
-            current_titles = self.get_listing_signature(driver)
-            if old_title not in current_titles and new_title in current_titles:
-                return "renamed", None
+                current_titles = self.get_listing_signature(driver)
+                if old_title not in current_titles and new_title in current_titles:
+                    return "renamed", None
 
+                return False
+            except StaleElementReferenceException:
+                return False
+
+        try:
+            result, message = wait.until(rename_result)
+        except TimeoutException as exc:
+            self.logging_service.write(
+                f"SharePoint did not confirm the folder rename from "
+                f"{old_title!r} to {new_title!r} after exiting grid view. "
+                f"Error: {exc}",
+                level=logging.ERROR,
+            )
             return False
 
-        result, message = wait.until(rename_result)
-
-        if result == "error":
+        if result in ("collision", "error"):
             context = getattr(self, "_catalog_log_context", None)
+            description = (
+                "Name collision"
+                if result == "collision"
+                else "SharePoint rejected the folder rename"
+            )
             self.logging_service.write(
-                f"SharePoint rejected the folder rename. "
-                f"Current folder: {old_title!r}; requested title: {new_title!r}; "
-                f"SharePoint message: {message!r}; catalog context: {context!r}. "
+                f"{description}. Current folder: {old_title!r}; "
+                f"requested title: {new_title!r}; "
+                f"SharePoint message: {message!r}; "
+                f"catalog context: {context!r}. "
                 "Skipping this folder and continuing.",
                 level=logging.ERROR,
             )
-            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            try:
+                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except WebDriverException:
+                pass
             return False
 
         folder["title"] = new_title
@@ -1382,6 +1468,7 @@ class TextbookCatalogingService:
             "word": "docx",
             "tif": "tif",
             "tiff": "tif",
+            "other": "other",
         }
 
         expected_format_set = {
@@ -1747,6 +1834,14 @@ class TextbookCatalogingService:
         if not isinstance(author_entries, (list, tuple)):
             author_entries = [author_entries]
 
+        def clean_author_credit(value):
+            return re.sub(
+                r"\[\s*edited\s+by\s*\]\s*",
+                "",
+                str(value or ""),
+                flags=re.IGNORECASE,
+            ).strip()
+
         author_names = []
         seen_names = set()
 
@@ -1766,7 +1861,7 @@ class TextbookCatalogingService:
             elif author is not None:
                 name = str(author)
 
-            name = str(name or "").strip()
+            name = clean_author_credit(name)
             if not name:
                 continue
 
@@ -1787,7 +1882,7 @@ class TextbookCatalogingService:
                     str(author).strip() for author in authors if str(author).strip()
                 )
 
-            authors = str(authors).strip() if authors else None
+            authors = clean_author_credit(authors) if authors else None
 
         publishers = catalog.get("publishers") or catalog.get("publisher")
         if isinstance(publishers, (list, tuple)):
@@ -1950,62 +2045,88 @@ class TextbookCatalogingService:
         return True
 
     def download_sharepoint_file(self, driver, wait, item):
-        download_wait = WebDriverWait(driver, 30)
-        before = set(self.download_dir.iterdir())
-        title_element = item["_elements"]["title"]
+        with self.logging_service.spinner(
+            f"Downloading {item.get('title') or 'SharePoint file'}"
+        ):
+            download_wait = WebDriverWait(driver, 35)
+            before = set(self.download_dir.iterdir())
+            title_element = item["_elements"]["title"]
 
-        download_wait.until(EC.visibility_of(title_element))
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", title_element
-        )
-        ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
-
-        row = title_element.find_element(
-            By.XPATH,
-            "./ancestor::*[@role='row'][1]",
-        )
-        more_actions = row.find_element(
-            By.CSS_SELECTOR,
-            'button[data-automationid="moreActionsHeroField"]',
-        )
-
-        download_wait.until(EC.visibility_of(more_actions))
-        driver.execute_script("arguments[0].click();", more_actions)
-
-        download_button_locator = (
-            By.CSS_SELECTOR,
-            'button[data-automationid="downloadCommand"]',
-        )
-        download_button = download_wait.until(
-            EC.visibility_of_element_located(download_button_locator)
-        )
-        driver.execute_script("arguments[0].click();", download_button)
-
-        deadline = time.monotonic() + 180
-        while time.monotonic() < deadline:
-            new_files = [
-                path
-                for path in self.download_dir.iterdir()
-                if path not in before and path.is_file()
-            ]
-            partial_download = any(
-                path.name.endswith((".crdownload", ".tmp")) for path in new_files
+            download_wait.until(EC.visibility_of(title_element))
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", title_element
             )
-            completed_files = [
-                path
-                for path in new_files
-                if not path.name.endswith((".crdownload", ".tmp"))
-            ]
+            ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
 
-            if completed_files and not partial_download:
-                return max(completed_files, key=lambda path: path.stat().st_mtime)
+            row = title_element.find_element(
+                By.XPATH,
+                "./ancestor::*[@role='row'][1]",
+            )
+            more_actions = row.find_element(
+                By.CSS_SELECTOR,
+                'button[data-automationid="moreActionsHeroField"]',
+            )
 
-            time.sleep(0.5)
+            download_wait.until(EC.visibility_of(more_actions))
+            driver.execute_script("arguments[0].click();", more_actions)
 
-        raise TimeoutError(
-            f"SharePoint did not finish downloading {item['title']!r} "
-            "within 180 seconds."
-        )
+            download_button_locator = (
+                By.CSS_SELECTOR,
+                'button[data-automationid="downloadCommand"]',
+            )
+            download_button = download_wait.until(
+                EC.visibility_of_element_located(download_button_locator)
+            )
+            driver.execute_script("arguments[0].click();", download_button)
+
+            def new_download_files():
+                return [
+                    path
+                    for path in self.download_dir.iterdir()
+                    if path not in before and path.is_file()
+                ]
+
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                run_download_files = new_download_files()
+                partial_download = any(
+                    path.name.endswith((".crdownload", ".tmp"))
+                    for path in run_download_files
+                )
+                completed_files = [
+                    path
+                    for path in run_download_files
+                    if not path.name.endswith((".crdownload", ".tmp"))
+                ]
+
+                if completed_files and not partial_download:
+                    return max(
+                        completed_files,
+                        key=lambda path: path.stat().st_mtime,
+                    )
+
+                time.sleep(0.5)
+
+            # These files were created during this download attempt and are
+            # confined to this run's dedicated directory.
+            for path in new_download_files():
+                try:
+                    path.unlink()
+                    self.logging_service.write(
+                        f"Removed incomplete SharePoint download: {path.name}",
+                        level=logging.WARNING,
+                    )
+                except OSError as exc:
+                    self.logging_service.write(
+                        f"Could not remove incomplete SharePoint download "
+                        f"{path}: {exc}",
+                        level=logging.WARNING,
+                    )
+
+            raise TimeoutError(
+                f"SharePoint did not finish downloading {item['title']!r} "
+                "within 180 seconds."
+            )
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
         extension = file_path.suffix.casefold()
@@ -2118,6 +2239,11 @@ class TextbookCatalogingService:
 
     def __init__(self):
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.download_dir = (
+            Path.home()
+            / "Downloads"
+            / f"sharepoint_textbook_cataloging_{run_timestamp}"
+        )
         log_path = Path(__file__).with_name(f"textbook_cataloging_{run_timestamp}.log")
         self.logging_service = LogService(log_path)
         self.api_service = ApiService(logging_service=self.logging_service)
@@ -2175,8 +2301,7 @@ class TextbookCatalogingService:
             return False
 
         try:
-            self.download_dir = Path.home() / "Downloads"
-            self.download_dir.mkdir(exist_ok=True)
+            self.download_dir.mkdir(parents=True, exist_ok=True)
 
             options = Options()
             options.add_experimental_option(
@@ -2266,7 +2391,16 @@ class TextbookCatalogingService:
                         book_folder.get("file_extensions") or []
                     )
                     original_title = parent_folder.get("title")
-                    self.update_folder_from_catalog(driver, wait, parent_folder, result)
+                    update_succeeded = self.update_folder_from_catalog(
+                        driver, wait, parent_folder, result
+                    )
+
+                    if not update_succeeded:
+                        current_parent_title = str(
+                            parent_folder.get("title") or ""
+                        ).casefold()
+                        if current_parent_title:
+                            processed_titles.add(current_parent_title)
 
                     if parent_folder.get("title") == original_title:
                         self.skipped_folder_renames += 1
@@ -2280,8 +2414,6 @@ class TextbookCatalogingService:
                         f"{book_folder.get('title')!r}: no eligible catalog "
                         f"result or parent folder row."
                     )
-                # NOTE: pause after each folder
-                # input("\nPress Enter to continue...")
 
         except (TimeoutException, TimeoutError) as exc:
             catalog_context = getattr(self, "_catalog_log_context", None)
@@ -2317,6 +2449,63 @@ class TextbookCatalogingService:
             if driver:
                 input("\nPress Enter to close Edge and finish the script...")
                 driver.quit()
+
+            try:
+                self.download_dir.rmdir()
+                self.logging_service.write(
+                    f"Removed empty run-specific download directory: "
+                    f"{self.download_dir}"
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.logging_service.write(
+                    f"Run-specific download directory was not empty or could "
+                    f"not be removed: {self.download_dir}: {exc}",
+                    level=logging.WARNING,
+                )
+
+    def main():
+        parser = argparse.ArgumentParser(
+            description="Catalog textbook folders in SharePoint."
+        )
+        parser.add_argument(
+            "--sid",
+            required=True,
+            help="Windows user-folder name used to locate Tesseract.",
+        )
+        parser.add_argument(
+            "--google-books-fallback",
+            action="store_true",
+            help="Try Google Books if Open Library does not find a record.",
+        )
+        parser.add_argument(
+            "--max-folders-to-rename",
+            type=int,
+            default=30,
+            help="Maximum folders to process (default 30; values above 30 are capped).",
+        )
+        args = parser.parse_args()
+
+        sid = args.sid.strip()
+        if not sid or Path(sid).name != sid:
+            parser.error(
+                "--sid must be your Windows user-folder name, not a full path."
+            )
+
+        pytesseract.pytesseract.tesseract_cmd = str(
+            Path("C:/Users")
+            / sid
+            / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
+        )
+        TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(
+            1, min(args.max_folders_to_rename, 50)
+        )
+        ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = args.google_books_fallback
+        TextbookCatalogingService()
+
+    if __name__ == "__main__":
+        main()
 
 
 if __name__ == "__main__":
