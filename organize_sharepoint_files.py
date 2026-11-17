@@ -41,14 +41,15 @@ class TextbookCatalogingService:
         "%2FAlternative%20Formats%2FTextbooks%2FArchives"
         "&sortField=BookTitle&isAscending=true"
     )
-    SUPPORTED_EXTENSIONS = {"pdf", "tif", "tiff", "epub", "docx", "doc"}
+    SUPPORTED_EXTENSIONS = {"pdf", "tif", "tiff", "epub", "docx", "doc", "rtf"}
     PHONE_PATTERN = re.compile(
         r"(?<!\d)\(?\d{3}\)?[^\dA-Za-z]+\d{3}[^\dA-Za-z]+\d{4}(?!\d)"
     )
     ISBN_13_PATTERN = re.compile(r"(?<!\d)97[89](?:[^\dA-Za-z]?\d){10}(?!\d)")
     ISBN_10_PATTERN = re.compile(r"(?<!\d)(?:\d[^\dA-Za-z]?){9}[\dXx](?!\d)")
     MINIMUM_ROWS_TO_LOAD = 12
-    MAX_DOWNLOADED_PAGES_TO_SCAN = 8
+    MAX_FRONT_PAGES_TO_SCAN = 10
+    MAX_BACK_PAGES_TO_SCAN = 5
 
     def get_listing_signature(self, driver):
         elements = driver.find_elements(
@@ -81,54 +82,78 @@ class TextbookCatalogingService:
             '[aria-busy="true"], [role="progressbar"], '
             '[data-automationid*="loading"]'
         )
+        see_more_selector = 'div[role="gridcell"][class*="seeMoreCell"] button'
 
-        while time.monotonic() < deadline:
-            try:
-                signature = self.get_listing_signature(driver)
+        with self.logging_service.spinner("Waiting for SharePoint folder listing"):
+            while time.monotonic() < deadline:
+                try:
+                    signature = self.get_listing_signature(driver)
+                    body_text = driver.find_element(By.TAG_NAME, "body").text.casefold()
 
-                body_text = driver.find_element(By.TAG_NAME, "body").text.casefold()
+                    busy_elements = driver.find_elements(
+                        By.CSS_SELECTOR,
+                        busy_selector,
+                    )
+                    busy = any(element.is_displayed() for element in busy_elements)
 
-                busy_elements = driver.find_elements(By.CSS_SELECTOR, busy_selector)
-                busy = any(element.is_displayed() for element in busy_elements)
-                empty = any(phrase in body_text for phrase in empty_phrases)
+                    see_more_buttons = driver.find_elements(
+                        By.CSS_SELECTOR,
+                        see_more_selector,
+                    )
+                    see_more_visible = any(
+                        button.is_displayed() for button in see_more_buttons
+                    )
 
-            except StaleElementReferenceException:
-                # SharePoint refreshed the page while Selenium was reading it.
-                time.sleep(0.5)
-                continue
+                    empty = any(phrase in body_text for phrase in empty_phrases)
 
-            has_results_or_empty_message = bool(signature) or empty
-            changed_from_parent = (
-                previous_signature is None
-                or not previous_signature
-                or signature != previous_signature
-            )
+                except StaleElementReferenceException:
+                    time.sleep(0.5)
+                    continue
 
-            if has_results_or_empty_message and changed_from_parent and not busy:
-                if signature == last_signature:
-                    if (
-                        stable_since is not None
-                        and time.monotonic() - stable_since >= 2
-                    ):
-                        return signature
+                has_results_or_empty_message = (
+                    bool(signature) or empty or see_more_visible
+                )
+                changed_from_parent = (
+                    previous_signature is None
+                    or not previous_signature
+                    or signature != previous_signature
+                )
+
+                # A visible See more button means SharePoint has presented a
+                # usable batch, even if its broad loading indicator remains set.
+                listing_usable = not busy or see_more_visible
+
+                if (
+                    has_results_or_empty_message
+                    and changed_from_parent
+                    and listing_usable
+                ):
+                    if signature == last_signature:
+                        if (
+                            stable_since is not None
+                            and time.monotonic() - stable_since >= 2
+                        ):
+                            return signature
+                    else:
+                        last_signature = signature
+                        stable_since = time.monotonic()
                 else:
-                    last_signature = signature
-                    stable_since = time.monotonic()
-            else:
-                last_signature = None
-                stable_since = None
+                    last_signature = None
+                    stable_since = None
 
-            time.sleep(0.5)
+                time.sleep(0.5)
 
-        raise TimeoutError("The SharePoint folder listing did not finish loading.")
+        raise TimeoutError(
+            "SharePoint did not present a stable folder listing or See more button."
+        )
 
     def inspect_open_folder(self, driver, wait, current_folder):
         self._detected_formats = []
         self._detected_edition = None
         self._selected_isbn = None
 
-        supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc"}
-        format_priority = ("pdf", "tif", "tiff", "epub", "docx", "doc")
+        supported_extensions = set(self.SUPPORTED_EXTENSIONS) | {"doc", "rtf"}
+        format_priority = ("pdf", "epub", "docx", "tif", "tiff", "doc", "rtf")
         scannable_extensions = {
             ".pdf",
             ".tif",
@@ -137,6 +162,7 @@ class TextbookCatalogingService:
             ".jpeg",
             ".docx",
             ".doc",
+            ".rtf",
             ".epub",
         }
         folders = self.get_folders_to_update(driver)
@@ -161,7 +187,24 @@ class TextbookCatalogingService:
 
         def is_end_matter(item):
             return bool(
-                title_tokens(item) & {"end", "back", "bm", "endmatter", "backmatter"}
+                title_tokens(item)
+                & {
+                    "end",
+                    "back",
+                    "bm",
+                    "endmatter",
+                    "backmatter",
+                    "endnote",
+                    "endnotes",
+                }
+            )
+
+        def is_chapter_one(item):
+            return bool(
+                re.search(
+                    r"\b(?:chapter|ch)\s*0*1\b",
+                    normalized_title(item),
+                )
             )
 
         def edition_from_text(text):
@@ -288,8 +331,7 @@ class TextbookCatalogingService:
 
             if not catalog:
                 self.logging_service.write(
-                    f"Open Library did not return a record for ISBN {isbn}. "
-                    "TODO: CHECK on GOOGLE API for ISBN-13.",
+                    f"Open Library did not return a record for ISBN {isbn}. ",
                     level=logging.WARNING,
                 )
 
@@ -623,268 +665,381 @@ class TextbookCatalogingService:
                 level=logging.WARNING,
             )
 
-        scannable_files = [
+        all_scannable_files = [
             (item, path) for item, path in file_locations if is_scannable_file(item)
         ]
-        scannable_files.sort(
+
+        def matter_priority(entry):
+            item = entry[0]
+            tokens = title_tokens(item)
+
+            if is_front_matter(item):
+                return 0
+            if is_end_matter(item):
+                return 1
+            if tokens & {
+                "matter",
+                "index",
+                "title",
+                "copyright",
+                "isbn",
+                "catalog",
+                "cataloging",
+                "bibliographic",
+                "publication",
+            }:
+                return 2
+            if is_chapter_one(item):
+                return 3
+
+            return None
+
+        extension_priority = {
+            ".pdf": 0,
+            ".epub": 1,
+            ".docx": 2,
+            ".tif": 3,
+            ".tiff": 3,
+            ".doc": 4,
+            ".rtf": 5,
+            ".jpg": 6,
+            ".jpeg": 6,
+        }
+
+        priority_files = [
+            entry for entry in all_scannable_files if matter_priority(entry) is not None
+        ]
+
+        priority_files.sort(
             key=lambda entry: (
-                0 if format_for(entry[0]) == "pdf" else 1,
-                (
-                    format_priority.index(format_for(entry[0]))
-                    if format_for(entry[0]) in format_priority
-                    else 99
+                matter_priority(entry),
+                extension_priority.get(
+                    os.path.splitext(str(entry[0].get("title") or ""))[1].casefold(),
+                    99,
                 ),
             )
         )
 
-        front_matter_entry = next(
-            (entry for entry in scannable_files if is_front_matter(entry[0])),
-            None,
-        )
-        end_matter_entry = next(
-            (entry for entry in scannable_files if is_end_matter(entry[0])),
-            None,
-        )
-        other_matter_entry = next(
-            (
-                entry
-                for entry in scannable_files
-                if "matter" in normalized_title(entry[0])
-                and not is_front_matter(entry[0])
-                and not is_end_matter(entry[0])
-            ),
-            None,
-        )
-        copyright_entry = next(
-            (
-                entry
-                for entry in scannable_files
-                if "copyright" in title_tokens(entry[0])
-            ),
-            None,
-        )
-        title_entry = next(
-            (entry for entry in scannable_files if "title" in title_tokens(entry[0])),
-            None,
-        )
-
-        matter_entry = (
-            front_matter_entry
-            or end_matter_entry
-            or other_matter_entry
-            or copyright_entry
-            or title_entry
-            or (scannable_files[0] if scannable_files else None)
-        )
-
-        if front_matter_entry:
-            selection_reason = "front matter"
-        elif end_matter_entry:
-            selection_reason = "end matter"
-        elif other_matter_entry:
-            selection_reason = "other matter file"
-        elif copyright_entry:
-            selection_reason = "copyright file"
-        elif title_entry:
-            selection_reason = "title file"
-        else:
-            selection_reason = "first scannable file"
-
-        if matter_entry:
-            matter_file, matter_path = matter_entry
-            self.logging_service.write(
-                f"Selected {selection_reason}: {matter_file['title']!r}"
+        def file_key(entry):
+            item, folder_path = entry
+            return (
+                str(item.get("title") or "").casefold(),
+                tuple(folder_path),
             )
-        else:
-            matter_file = None
-            matter_path = ()
 
-        if not matter_file:
-            if isbn_10_candidates:
-                isbn = isbn_10_candidates[0]
-                self.logging_service.write(
-                    f"Only ISBN-10 was found in item titles; looking it up: {isbn}"
+        selected_keys = {file_key(entry) for entry in priority_files}
+
+        # Add at most one remaining file per extension as a fallback. This lets
+        # an unnamed EPUB/DOCX/TIFF get scanned without downloading every chapter.
+        fallback_by_extension = {}
+
+        for entry in all_scannable_files:
+            if file_key(entry) in selected_keys:
+                continue
+
+            filename = str(entry[0].get("title") or "")
+            extension = os.path.splitext(filename)[1].casefold()
+
+            if extension not in fallback_by_extension:
+                fallback_by_extension[extension] = entry
+
+        fallback_files = sorted(
+            fallback_by_extension.values(),
+            key=lambda entry: (
+                extension_priority.get(
+                    os.path.splitext(str(entry[0].get("title") or ""))[1].casefold(),
+                    99,
+                ),
+                str(entry[0].get("title") or "").casefold(),
+            ),
+        )
+
+        scannable_files = priority_files + fallback_files
+
+        scanned_isbn_10 = None
+
+        for index, (matter_file, matter_path) in enumerate(scannable_files):
+            filename = str(matter_file.get("title") or "")
+            extension = os.path.splitext(filename)[1].casefold()
+            tokens = title_tokens(matter_file)
+            is_chapter_file = bool(
+                re.search(
+                    r"\b(?:chapter|ch)\s*0*\d+\b",
+                    normalized_title(matter_file),
                 )
-                return lookup_catalog(isbn)
+            )
+
+            if is_end_matter(matter_file) or "index" in tokens:
+                matter_type = "end"
+            elif (
+                is_front_matter(matter_file)
+                or is_chapter_file
+                or tokens
+                & {
+                    "matter",
+                    "title",
+                    "copyright",
+                    "isbn",
+                    "catalog",
+                    "cataloging",
+                    "bibliographic",
+                    "publication",
+                }
+            ):
+                matter_type = "front"
+            else:
+                # Generic fallback file, treated as a likely full textbook.
+                matter_type = "full"
+            downloaded_path = None
 
             self.logging_service.write(
-                "No ISBN-13 or ISBN-10 was found. ",
-                level=logging.WARNING,
+                f"Trying file {index + 1}/{len(scannable_files)} "
+                f"({extension or 'unknown'}): {filename!r}"
             )
-            return None
 
-        matter_type = "end" if is_end_matter(matter_file) else "front"
-        downloaded_path = None
+            try:
+                # Return to this book's listing before trying another candidate.
+                if index > 0:
+                    driver.get(root_url)
+                    self.wait_for_folder_listing(driver)
 
-        try:
-            for folder_title in matter_path:
+                for folder_title in matter_path:
+                    live_items = self.get_folders_to_update(driver)
+                    live_folder = next(
+                        (
+                            item
+                            for item in live_items
+                            if item.get("is_folder")
+                            and str(item.get("title") or "") == folder_title
+                        ),
+                        None,
+                    )
+                    if not live_folder:
+                        raise TimeoutError(
+                            f"Could not reopen folder {folder_title!r} "
+                            f"to scan {filename!r}."
+                        )
+                    self.open_folder(driver, wait, live_folder)
+
                 live_items = self.get_folders_to_update(driver)
-                live_folder = next(
+                live_file = next(
                     (
                         item
                         for item in live_items
-                        if item.get("is_folder")
-                        and str(item.get("title") or "") == folder_title
+                        if not item.get("is_folder")
+                        and str(item.get("title") or "") == filename
                     ),
                     None,
                 )
-                if not live_folder:
+                if not live_file:
                     raise TimeoutError(
-                        f"Could not reopen folder {folder_title!r} to download "
-                        f"{matter_file['title']!r}."
+                        f"Could not find {filename!r} in its folder listing."
                     )
-                self.open_folder(driver, wait, live_folder)
 
-            live_items = self.get_folders_to_update(driver)
-            live_matter_file = next(
-                (
-                    item
-                    for item in live_items
-                    if not item.get("is_folder")
-                    and str(item.get("title") or "")
-                    == str(matter_file.get("title") or "")
-                ),
-                None,
-            )
-            if not live_matter_file:
-                raise TimeoutError(
-                    f"Could not find matter file {matter_file['title']!r} "
-                    "in its folder listing."
+                downloaded_path = self.download_sharepoint_file(
+                    driver,
+                    wait,
+                    live_file,
+                )
+                self.logging_service.write("Downloaded:", downloaded_path)
+
+                downloaded_isbn = self.find_isbn_in_downloaded_file(
+                    downloaded_path,
+                    matter_type,
                 )
 
-            downloaded_path = self.download_sharepoint_file(
-                driver,
-                wait,
-                live_matter_file,
-            )
-            self.logging_service.write("Downloaded:", downloaded_path)
+            except Exception as exc:
+                self.logging_service.exception(
+                    f"Failed to download or scan {filename!r} "
+                    f"for folder {current_folder.get('title')!r}; "
+                    f"trying the next candidate. "
+                    f"Error: {type(exc).__name__}: {exc}"
+                )
+                continue
 
-            downloaded_isbn = self.find_isbn_in_downloaded_file(
-                downloaded_path,
-                matter_type,
-            )
-        except Exception as exc:
-            self.logging_service.exception(
-                f"Failed to download or scan matter file {matter_file['title']!r} "
-                f"for folder {current_folder.get('title')!r}; skipping this folder "
-                f"and continuing. Error: {type(exc).__name__}: {exc}"
-            )
-            return None
-        finally:
-            if downloaded_path is not None and downloaded_path.is_file():
-                try:
-                    downloaded_path.unlink()
-                    self.logging_service.write(
-                        f"Deleted temporary downloaded file: {downloaded_path}"
-                    )
-                except OSError as cleanup_error:
-                    self.logging_service.write(
-                        f"Could not delete temporary downloaded file "
-                        f"{downloaded_path}: {cleanup_error}",
-                        level=logging.WARNING,
-                    )
+            finally:
+                if downloaded_path is not None and downloaded_path.is_file():
+                    try:
+                        downloaded_path.unlink()
+                        self.logging_service.write(
+                            f"Deleted temporary downloaded file: {downloaded_path}"
+                        )
+                    except OSError as cleanup_error:
+                        self.logging_service.write(
+                            f"Could not delete temporary downloaded file "
+                            f"{downloaded_path}: {cleanup_error}",
+                            level=logging.WARNING,
+                        )
 
-        if downloaded_isbn and len(downloaded_isbn) == 13:
-            isbn = downloaded_isbn
-            self.logging_service.write(
-                f"Found ISBN-13 in downloaded file {matter_file['title']!r}: {isbn}"
-            )
-        elif isbn_10_candidates:
+            if downloaded_isbn and len(downloaded_isbn) == 13:
+                self.logging_service.write(
+                    f"Found ISBN-13 in downloaded file "
+                    f"{filename!r}: {downloaded_isbn}"
+                )
+                return lookup_catalog(downloaded_isbn)
+
+            if downloaded_isbn and len(downloaded_isbn) == 10:
+                if scanned_isbn_10 is None:
+                    scanned_isbn_10 = downloaded_isbn
+                self.logging_service.write(
+                    f"Found ISBN-10 in downloaded file {filename!r}: "
+                    f"{downloaded_isbn}; continuing to look for an ISBN-13."
+                )
+            else:
+                self.logging_service.write(
+                    f"No ISBN-13 or ISBN-10 was found in {filename!r}; "
+                    "trying the next candidate.",
+                    level=logging.WARNING,
+                )
+
+        if isbn_10_candidates:
             isbn = isbn_10_candidates[0]
             self.logging_service.write(
-                f"Only ISBN-10 was found in item titles; looking it up: {isbn}"
+                f"No ISBN-13 found in the scanned files; using ISBN-10 "
+                f"found in item titles: {isbn}"
             )
-        elif downloaded_isbn:
-            isbn = downloaded_isbn
-            self.logging_service.write(
-                f"Found ISBN-10 in downloaded file {matter_file['title']!r}: {isbn}"
-            )
-        else:
-            self.logging_service.write(
-                f"No ISBN-13 or ISBN-10 was found in the downloaded file "
-                f"{matter_file['title']!r}. ",
-                level=logging.WARNING,
-            )
-            return None
+            return lookup_catalog(isbn)
 
-        return lookup_catalog(isbn)
+        if scanned_isbn_10:
+            self.logging_service.write(
+                f"No ISBN-13 found in the scanned files; using scanned ISBN-10: "
+                f"{scanned_isbn_10}"
+            )
+            return lookup_catalog(scanned_isbn_10)
+
+        self.logging_service.write(
+            "No ISBN-13 or ISBN-10 was found in any eligible scannable file.",
+            level=logging.WARNING,
+        )
+        return None
 
     def enter_grid_view(self, driver, wait, folder_title):
-        def find_edit_grid_button(driver):
-            candidates = driver.find_elements(
-                By.CSS_SELECTOR,
-                'button, [role="button"], [role="menuitem"]',
-            )
-            for candidate in candidates:
-                if not candidate.is_displayed() or not candidate.is_enabled():
-                    continue
+        def normalized(value):
+            return " ".join(str(value or "").split()).casefold()
 
-                labels = (
-                    candidate.get_attribute("data-automationid"),
-                    candidate.get_attribute("aria-label"),
-                    candidate.get_attribute("title"),
-                    candidate.text,
+        grid_view_deadline = time.monotonic() + 30
+
+        def wait_for_grid_action(condition):
+            remaining = grid_view_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutException(
+                    "Timed out locating the Edit in grid view command."
                 )
-                if any(
-                    "edit in grid view" in " ".join(str(label or "").split()).casefold()
-                    or str(label or "").casefold() == "editInGridViewCommand".casefold()
-                    for label in labels
-                ):
-                    return candidate
+            return WebDriverWait(driver, remaining).until(condition)
+
+        def get_folder_row(driver):
+            folder = self.get_folder_by_title(driver, folder_title)
+            if not folder:
+                return False
+
+            try:
+                row = folder["_elements"]["row"]
+                rowheader = row.find_element(
+                    By.CSS_SELECTOR,
+                    '[data-automationid="field-LinkFilename"]',
+                )
+
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});",
+                    rowheader,
+                )
+                ActionChains(driver).move_to_element(rowheader).pause(0.3).perform()
+
+                return row, rowheader
+            except StaleElementReferenceException:
+                return False
+
+        def get_row_more_actions(driver):
+            row_data = get_folder_row(driver)
+            if not row_data:
+                return False
+
+            row, _ = row_data
+            try:
+                buttons = row.find_elements(
+                    By.CSS_SELECTOR,
+                    'button[data-automationid="moreActionsHeroField"]',
+                )
+                return next(
+                    (
+                        button
+                        for button in buttons
+                        if button.is_displayed() and button.is_enabled()
+                    ),
+                    False,
+                )
+            except StaleElementReferenceException:
+                return False
+
+        def find_edit_grid_button(driver):
+            try:
+                candidates = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    'button, [role="button"], [role="menuitem"]',
+                )
+                for candidate in candidates:
+                    try:
+                        if not candidate.is_displayed() or not candidate.is_enabled():
+                            continue
+
+                        labels = (
+                            candidate.get_attribute("data-automationid"),
+                            candidate.get_attribute("aria-label"),
+                            candidate.get_attribute("title"),
+                            candidate.get_attribute("data-command-key"),
+                            candidate.text,
+                        )
+                        if any(
+                            "edit in grid view" in normalized(label) for label in labels
+                        ):
+                            return candidate
+                    except StaleElementReferenceException:
+                        continue
+            except StaleElementReferenceException:
+                return False
 
             return False
 
-        try:
-            grid_view_deadline = time.monotonic() + 10
+        def grid_view_is_active(driver):
+            more_actions = get_row_more_actions(driver)
+            if not more_actions:
+                return False
 
-            def wait_for_grid_action(condition):
-                remaining = grid_view_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutException(
-                        "Timed out locating the Edit in grid view command."
-                    )
-                return WebDriverWait(driver, remaining).until(condition)
-
-            target_folder = self.get_folder_by_title(driver, folder_title)
-            if not target_folder:
-                raise TimeoutException(
-                    f"Could not find renamed folder {folder_title!r} in the listing."
-                )
-
-            # The command may be exposed only in the target row's More Actions menu.
-            edit_button = find_edit_grid_button(driver)
-            if not edit_button:
-                title_element = target_folder["_elements"]["title"]
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});",
-                    title_element,
-                )
-                ActionChains(driver).move_to_element(title_element).pause(0.3).perform()
-
-                folder_row = title_element.find_element(
-                    By.XPATH,
-                    "./ancestor::*[@role='row'][1]",
-                )
-                more_actions = wait_for_grid_action(
-                    lambda d: next(
-                        (
-                            button
-                            for button in folder_row.find_elements(
-                                By.CSS_SELECTOR,
-                                'button[data-automationid="moreActionsHeroField"]',
-                            )
-                            if button.is_displayed() and button.is_enabled()
-                        ),
-                        False,
-                    )
-                )
+            try:
                 driver.execute_script("arguments[0].click();", more_actions)
-                edit_button = wait_for_grid_action(find_edit_grid_button)
 
-            driver.execute_script("arguments[0].click();", edit_button)
+                exit_grid_locator = (
+                    By.CSS_SELECTOR,
+                    'button[data-automationid="exitGridCommand"]',
+                )
+                try:
+                    WebDriverWait(driver, 5).until(
+                        EC.visibility_of_element_located(exit_grid_locator)
+                    )
+                    return True
+                except TimeoutException:
+                    return False
+                finally:
+                    try:
+                        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                    except WebDriverException:
+                        pass
+            except (StaleElementReferenceException, WebDriverException):
+                return False
+
+        try:
             wait_for_grid_action(
-                lambda d: self.get_folder_by_title(d, folder_title) is not None
+                lambda d: self.get_folder_by_title(d, folder_title) or False
             )
+
+            more_actions = wait_for_grid_action(get_row_more_actions)
+            driver.execute_script("arguments[0].click();", more_actions)
+
+            edit_button = wait_for_grid_action(find_edit_grid_button)
+            driver.execute_script("arguments[0].click();", edit_button)
+
+            wait_for_grid_action(grid_view_is_active)
+
             self.logging_service.write(
                 f"Re-entered grid view for folder {folder_title!r} "
                 "after saving its ISBN rename."
@@ -943,7 +1098,8 @@ class TextbookCatalogingService:
         wait.until(
             lambda d: len(
                 d.find_elements(
-                    By.CSS_SELECTOR, '[role="row"][data-automationid^="row-"]'
+                    By.CSS_SELECTOR,
+                    '[role="row"][data-automationid^="row-"]',
                 )
             )
             > self.MINIMUM_ROWS_TO_LOAD
@@ -951,32 +1107,119 @@ class TextbookCatalogingService:
 
         items = self.get_folders_to_update(driver)
         excluded_names = ("abueg", "izaiah", "burnett", "-sa")
+
+        passed_excluded_titles = excluded_titles
         excluded_titles = {str(title).casefold() for title in (excluded_titles or ())}
+        parent_listing_url = driver.current_url
 
-        for item in items:
-            modified_by = (item.get("modified_by") or "").casefold()
-            formats = (item.get("format") or "").strip()
-            book_title = (item.get("book_title") or "").strip()
-            title = str(item.get("title") or "")
-            excluded = any(name in modified_by for name in excluded_names)
+        while True:
+            eligible_folder = None
 
-            if (
-                item.get("is_folder")
-                and title.casefold() not in excluded_titles
-                and not excluded
-                and not formats
-                and not book_title
-            ):
-                if open_subfolders:
-                    self.open_folder(driver, wait, item)
-                return item
+            for item in items:
+                modified_by = (item.get("modified_by") or "").casefold()
+                formats = (item.get("format") or "").strip()
+                book_title = (item.get("book_title") or "").strip()
+                title = str(item.get("title") or "")
+                title_key = title.casefold()
+                excluded = any(name in modified_by for name in excluded_names)
 
-        print("No folder matches those conditions.")
-        self.logging_service.write(
-            f"No folder matches the conditions for opening. Folders: {items}",
-            level=logging.WARNING,
-        )
-        return None
+                if (
+                    item.get("is_folder")
+                    and title_key not in excluded_titles
+                    and not excluded
+                    and not formats
+                    and not book_title
+                ):
+                    eligible_folder = item
+                    break
+
+            if eligible_folder is None:
+                self.logging_service.write(
+                    f"No folder matches the conditions for opening. Folders: {items}",
+                    level=logging.WARNING,
+                )
+                return None
+
+            if not open_subfolders:
+                return eligible_folder
+
+            title = str(eligible_folder.get("title") or "")
+            title_key = title.casefold()
+
+            try:
+                self.open_folder(driver, wait, eligible_folder)
+                return eligible_folder
+
+            except (
+                TimeoutException,
+                TimeoutError,
+                StaleElementReferenceException,
+                WebDriverException,
+            ) as exc:
+                excluded_titles.add(title_key)
+                if isinstance(passed_excluded_titles, set):
+                    passed_excluded_titles.add(title_key)
+
+                self.logging_service.write(
+                    f"Could not open folder {title!r}: "
+                    f"{type(exc).__name__}: {exc}. "
+                    "Skipping it and trying the next eligible folder.",
+                    level=logging.WARNING,
+                )
+
+                recovered = False
+                for recovery_attempt in range(1, 3):
+                    try:
+                        driver.get(parent_listing_url)
+                        self.wait_for_folder_listing(driver, timeout=20)
+
+                        see_more_locator = (
+                            By.CSS_SELECTOR,
+                            'div[role="gridcell"][class*="seeMoreCell"] button',
+                        )
+                        see_more_buttons = driver.find_elements(*see_more_locator)
+                        if any(button.is_displayed() for button in see_more_buttons):
+                            self.click_safely(
+                                driver,
+                                WebDriverWait(driver, 10),
+                                see_more_locator,
+                            )
+                            self.wait_for_folder_listing(driver, timeout=20)
+
+                        WebDriverWait(driver, 15).until(
+                            lambda d: len(
+                                d.find_elements(
+                                    By.CSS_SELECTOR,
+                                    '[role="row"][data-automationid^="row-"]',
+                                )
+                            )
+                            > self.MINIMUM_ROWS_TO_LOAD
+                        )
+
+                        items = self.get_folders_to_update(driver)
+                        recovered = True
+                        break
+
+                    except (
+                        TimeoutException,
+                        TimeoutError,
+                        StaleElementReferenceException,
+                        WebDriverException,
+                    ) as recovery_exc:
+                        self.logging_service.write(
+                            f"Could not reload the parent folder listing "
+                            f"(attempt {recovery_attempt}/2): "
+                            f"{type(recovery_exc).__name__}: {recovery_exc}.",
+                            level=logging.WARNING,
+                        )
+
+                if not recovered:
+                    self.logging_service.write(
+                        "Could not restore the parent folder listing after the "
+                        "open-folder failure. Stopping folder selection.",
+                        level=logging.ERROR,
+                    )
+                    return None
 
     def click_safely(self, driver, wait, locator):
         try:
@@ -1252,6 +1495,7 @@ class TextbookCatalogingService:
 
         error_message_locator = (
             By.CSS_SELECTOR,
+            '[data-automationid="error-icon-button"][data-error-message], '
             '[data-automationid="list-info-callout-container"] '
             '[data-automationid="AsReactChildren"], '
             '[class*="errorCallout"] [data-automationid="AsReactChildren"], '
@@ -1264,17 +1508,25 @@ class TextbookCatalogingService:
                     if not message_element.is_displayed():
                         continue
 
-                    message = (message_element.text or "").strip()
-                    if message:
-                        message_lower = message.casefold()
-                        if message_lower in ignored_messages:
-                            continue
-                        if (
-                            "already exists" in message_lower
-                            or "duplicate" in message_lower
-                        ):
-                            return "collision", message
-                        return "error", message
+                    message = (
+                        message_element.get_attribute("data-error-message")
+                        or message_element.text
+                        or ""
+                    ).strip()
+                    if not message:
+                        continue
+
+                    message_lower = message.casefold()
+                    if message_lower in ignored_messages:
+                        continue
+
+                    if (
+                        "already exists" in message_lower
+                        or "duplicate" in message_lower
+                    ):
+                        return "collision", message
+
+                    return "error", message
 
                 current_titles = self.get_listing_signature(driver)
                 if old_title == new_title and new_title in current_titles:
@@ -1283,6 +1535,7 @@ class TextbookCatalogingService:
                     return "renamed", None
 
                 return False
+
             except StaleElementReferenceException:
                 return False
 
@@ -1389,6 +1642,7 @@ class TextbookCatalogingService:
             "doc": ("Docx",),
             "tif": ("TIF",),
             "tiff": ("TIF",),
+            "other": ("Other",),
         }
 
         extensions = list(dict.fromkeys(str(ext).casefold() for ext in formats))
@@ -1790,23 +2044,50 @@ class TextbookCatalogingService:
                     "SharePoint values cannot be confirmed."
                 )
 
+            self.wait_for_folder_listing(driver, timeout=30)
+
             see_more_locator = (
                 By.CSS_SELECTOR,
                 'div[role="gridcell"][class*="seeMoreCell"] button',
             )
+            pagination_wait = WebDriverWait(driver, 15)
 
-            for _ in range(3):
+            # Load successive batches because the ISBN rename may move the row
+            # farther down the sorted SharePoint listing.
+            for _ in range(100):
                 current_folder = find_target_folder(driver)
                 if current_folder:
                     return current_folder
 
-                if has_visible_see_more(driver):
-                    self.click_safely(driver, wait, see_more_locator)
-                    continue
+                if not has_visible_see_more(driver):
+                    break
 
-                wait.until(lambda d: find_target_folder(d) or has_visible_see_more(d))
+                previous_signature = self.get_listing_signature(driver)
+                self.click_safely(driver, pagination_wait, see_more_locator)
 
-            return wait.until(find_target_folder)
+                try:
+                    self.wait_for_folder_listing(
+                        driver,
+                        previous_signature=previous_signature,
+                        timeout=20,
+                    )
+                except TimeoutError:
+                    current_folder = find_target_folder(driver)
+                    if current_folder:
+                        return current_folder
+                    raise TimeoutException(
+                        "SharePoint did not load more rows while verifying "
+                        f"folder {expected_title!r}."
+                    )
+
+            current_folder = find_target_folder(driver)
+            if current_folder:
+                return current_folder
+
+            raise TimeoutException(
+                f"Could not find folder {expected_title!r} or "
+                f"{original_title!r} in the refreshed SharePoint listing."
+            )
 
         for verification_round in range(max_retries + 1):
             current_folder = reload_and_read_folder()
@@ -1930,7 +2211,8 @@ class TextbookCatalogingService:
             self.logging_service.write(
                 f"Catalog lookup ISBN {selected_isbn!r} did not produce a valid "
                 f"ISBN-13 for folder {folder.get('title')!r}. "
-                f"Catalog title: {catalog.get('title') or catalog.get('full_title')!r}; "
+                f"Catalog title: "
+                f"{catalog.get('title') or catalog.get('full_title')!r}; "
                 f"catalog ISBN-13 values: {isbn_13_value!r}. "
                 "The folder will not be renamed or updated.",
                 level=logging.ERROR,
@@ -1960,7 +2242,10 @@ class TextbookCatalogingService:
             folder.get("file_extensions"),
         ):
             if isinstance(format_values, str):
-                format_values = re.findall(r"[a-z0-9]+", format_values.casefold())
+                format_values = re.findall(
+                    r"[a-z0-9]+",
+                    format_values.casefold(),
+                )
             elif not isinstance(format_values, (list, tuple, set)):
                 format_values = [format_values] if format_values else []
 
@@ -1969,7 +2254,6 @@ class TextbookCatalogingService:
                 if extension and extension not in formats_to_apply:
                     formats_to_apply.append(extension)
 
-        original_folder_title = folder["title"]
         self._catalog_log_context = {
             "isbn": isbn,
             "catalog_title": title,
@@ -1999,29 +2283,55 @@ class TextbookCatalogingService:
                 return False
 
             # The rename function exits grid view to submit and check the ISBN.
-            # Re-enter grid view on the same renamed folder before editing metadata.
+            # Re-enter grid view on the renamed folder before editing metadata.
             if not self.enter_grid_view(driver, wait, folder["title"]):
                 self._catalog_log_context = None
                 return False
 
-        expected_folder_title = folder.get("title") or isbn
-
-        def attempt_cell_update(label, update):
-            try:
-                update()
-                return True
-            except (TimeoutException, TimeoutError, WebDriverException) as exc:
-                message = (
-                    f"Could not update {label} for folder {folder.get('title')!r} "
-                    f"(ISBN {isbn!r}): {type(exc).__name__}: {exc}. "
-                    "Continuing with the remaining cells."
-                )
-                self.logging_service.write(message, level=logging.ERROR)
+        def attempt_cell_update(label, update, max_attempts=1):
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                except WebDriverException:
-                    pass
-                return False
+                    update()
+
+                    if attempt > 1:
+                        self.logging_service.write(
+                            f"Updated {label} for folder {folder.get('title')!r} "
+                            f"on attempt {attempt}/{max_attempts}."
+                        )
+                    return True
+
+                except (TimeoutException, TimeoutError, WebDriverException) as exc:
+                    if attempt < max_attempts:
+                        self.logging_service.write(
+                            f"Could not update {label} for folder "
+                            f"{folder.get('title')!r} on attempt "
+                            f"{attempt}/{max_attempts}: "
+                            f"{type(exc).__name__}: {exc}. Retrying.",
+                            level=logging.WARNING,
+                        )
+                        try:
+                            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                        except WebDriverException:
+                            pass
+
+                        time.sleep(attempt)
+                        continue
+
+                    self.logging_service.write(
+                        f"Could not update {label} for folder "
+                        f"{folder.get('title')!r} after "
+                        f"{max_attempts} attempt(s): "
+                        f"{type(exc).__name__}: {exc}. "
+                        "Continuing with the remaining fields.",
+                        level=logging.ERROR,
+                    )
+                    try:
+                        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                    except WebDriverException:
+                        pass
+                    return False
+
+            return False
 
         self.logging_service.write(
             f"Applying detected formats for ISBN {isbn!r}: ",
@@ -2106,15 +2416,11 @@ class TextbookCatalogingService:
             or catalog.get("edition")
         )
 
-        expected_fields = {
-            field_name: value
-            for field_name, value in {
-                "book_title": title,
-                "author": authors,
-                "publisher": publishers,
-                "edition": edition,
-            }.items()
-            if value is not None and str(value).strip()
+        field_attempts = {
+            "book_title": 2,
+            "author": 2,
+            "publisher": 2,
+            "edition": 2,
         }
 
         for field_name, value in (
@@ -2128,12 +2434,23 @@ class TextbookCatalogingService:
                     field_name,
                     lambda field_name=field_name, value=value: (
                         self.update_folder_text_field(
-                            driver, wait, folder, field_name, value
+                            driver,
+                            wait,
+                            folder,
+                            field_name,
+                            value,
                         )
                     ),
+                    max_attempts=field_attempts[field_name],
+                )
+            elif field_name == "author":
+                self.logging_service.write(
+                    f"No author value was available to write for folder "
+                    f"{folder.get('title')!r}.",
+                    level=logging.WARNING,
                 )
 
-        # Submit the metadata edits by exiting grid view again after the last cell.
+        # Submit the metadata edits by exiting grid view after the last cell.
         folder = self.get_folder_by_title(driver, folder["title"]) or folder
         folder_title_element = folder["_elements"]["title"]
 
@@ -2176,89 +2493,10 @@ class TextbookCatalogingService:
             f"Exited grid view for folder {isbn!r}; "
             "continuing on the current listing."
         )
-
-        try:
-            verified_folder = self.verify_folder_catalog_update(
-                driver,
-                wait,
-                original_folder_title,
-                expected_folder_title,
-                formats_to_apply,
-                expected_fields,
-                max_retries=2,
-            )
-            if verified_folder is None:
-                self._catalog_log_context = None
-                return False
-            folder.update(verified_folder)
-        except (TimeoutException, TimeoutError) as exc:
-            self.logging_service.write(
-                f"Catalog update verification failed for folder "
-                f"{original_folder_title!r} (ISBN {isbn!r}); continuing to the "
-                f"next folder. Error: {type(exc).__name__}: {exc}. "
-                f"Catalog context: {self._catalog_log_context!r}",
-                level=logging.ERROR,
-            )
-            self._catalog_log_context = None
-            return False
-
-        updated_folder = self.get_folder_by_title(driver, folder["title"])
-        if updated_folder:
-            folder.update(updated_folder)
-
-        details = {
-            key: folder.get(key)
-            for key in (
-                "title",
-                "modified_by",
-                "format",
-                "book_title",
-                "author",
-                "publisher",
-                "edition",
-                "is_folder",
-            )
-        }
-        context = {
-            "isbn": isbn,
-            "catalog_title": title,
-            "folder_details": details,
-        }
-        self._catalog_log_context = context
-
-        def is_missing(value):
-            if value is None:
-                return True
-            if isinstance(value, (list, tuple, set, dict)):
-                return not value
-            return not str(value).strip()
-
-        required_fields = (
-            ("Book Title", "book_title"),
-            ("Author(s)", "author"),
-            ("Format(s)", "format"),
+        self.logging_service.write(
+            f"Post-update verification skipped for folder "
+            f"{folder.get('title')!r} (ISBN {isbn!r})."
         )
-        optional_fields = (("Publisher", "publisher"),)
-
-        for label, field_name in required_fields:
-            if is_missing(folder.get(field_name)):
-                self.logging_service.write(
-                    f"Required SharePoint cell {label!r} is missing. "
-                    f"ISBN: {context['isbn']!r}; "
-                    f"catalog title: {context['catalog_title']!r}; "
-                    f"details: {details!r}",
-                    level=logging.ERROR,
-                )
-
-        for label, field_name in optional_fields:
-            if is_missing(folder.get(field_name)):
-                self.logging_service.write(
-                    f"Optional SharePoint cell {label!r} is missing. "
-                    f"ISBN: {context['isbn']!r}; "
-                    f"catalog title: {context['catalog_title']!r}; "
-                    f"details: {details!r}",
-                    level=logging.WARNING,
-                )
 
         self._catalog_log_context = None
         return True
@@ -2348,121 +2586,148 @@ class TextbookCatalogingService:
             )
 
     def find_isbn_in_downloaded_file(self, file_path, matter_type):
-        extension = file_path.suffix.casefold()
-        max_pages_to_scan = getattr(self, "MAX_DOWNLOADED_PAGES_TO_SCAN", 8)
-        text_parts = []
+        def contains_isbn_13(text):
+            for match in self.ISBN_13_PATTERN.finditer(text or ""):
+                if not self.PHONE_PATTERN.fullmatch(match.group()):
+                    return True
+            return False
 
-        if extension == ".pdf":
-            reader = PdfReader(str(file_path))
-            pdf_for_ocr = pymupdf.open(str(file_path))
+        def pages_to_scan(page_count):
+            front_limit = getattr(self, "MAX_FRONT_PAGES_TO_SCAN", 10)
+            back_limit = getattr(self, "MAX_BACK_PAGES_TO_SCAN", 5)
 
             if matter_type == "end":
-                start = max(0, len(reader.pages) - max_pages_to_scan)
-                page_numbers = range(start, len(reader.pages))
-            else:
-                page_numbers = range(min(max_pages_to_scan, len(reader.pages)))
-
-            for page_number in page_numbers:
-                text = reader.pages[page_number].extract_text() or ""
-                if not text.strip():
-                    pixmap = pdf_for_ocr[page_number].get_pixmap(dpi=200)
-                    image = Image.frombytes(
-                        "RGB",
-                        (pixmap.width, pixmap.height),
-                        pixmap.samples,
-                    )
-                    text = pytesseract.image_to_string(image)
-
-                text_parts.append(text)
-
-        elif extension in {".tif", ".tiff"}:
-            with Image.open(file_path) as image:
-                frame_count = getattr(image, "n_frames", 1)
-
-                if matter_type == "end":
-                    start = max(0, frame_count - max_pages_to_scan)
-                    frame_numbers = range(start, frame_count)
-                else:
-                    frame_numbers = range(min(max_pages_to_scan, frame_count))
-
-                for frame_number in frame_numbers:
-                    image.seek(frame_number)
-                    text_parts.append(pytesseract.image_to_string(image.copy()))
-
-        elif extension in {".jpg", ".jpeg"}:
-            with Image.open(file_path) as image:
-                text_parts.append(pytesseract.image_to_string(image.convert("RGB")))
-
-        elif extension == ".docx":
-            document = Document(str(file_path))
-            text_parts.extend(paragraph.text for paragraph in document.paragraphs)
-            for table in document.tables:
-                for row in table.rows:
-                    text_parts.append(" ".join(cell.text for cell in row.cells))
-
-        elif extension == ".doc":
-            try:
-                import win32com.client
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Reading .doc files requires pywin32. Install it with: "
-                    "python -m pip install pywin32"
-                ) from exc
-
-            word = None
-            document = None
-            try:
-                word = win32com.client.DispatchEx("Word.Application")
-                word.Visible = False
-                word.DisplayAlerts = 0
-                document = word.Documents.Open(
-                    FileName=str(Path(file_path).resolve()),
-                    ConfirmConversions=False,
-                    ReadOnly=True,
-                    AddToRecentFiles=False,
-                    NoEncodingDialog=True,
+                return list(
+                    range(page_count - 1, max(-1, page_count - back_limit - 1), -1)
                 )
-                text_parts.append(document.Content.Text)
-            finally:
-                if document is not None:
-                    try:
-                        document.Close(SaveChanges=False)
-                    except Exception:
-                        pass
 
-                if word is not None:
-                    try:
-                        word.Quit(SaveChanges=False)
-                    except Exception:
-                        pass
+            front_pages = list(range(min(front_limit, page_count)))
 
-        elif extension == ".epub":
-            book = epub.read_epub(str(file_path))
-            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                soup = BeautifulSoup(item.get_content(), "html.parser")
-                text_parts.append(soup.get_text(" ", strip=True))
+            if matter_type != "full":
+                return front_pages
 
-        else:
-            raise ValueError(f"Unsupported file type: {extension}")
+            scanned_pages = set(front_pages)
+            back_start = max(0, page_count - back_limit)
+            back_pages = [
+                page_number
+                for page_number in range(page_count - 1, back_start - 1, -1)
+                if page_number not in scanned_pages
+            ]
+            return front_pages + back_pages
 
-        text = "\n".join(text_parts)
+        with self.logging_service.spinner(f"Scanning {file_path.name} for an ISBN"):
+            extension = file_path.suffix.casefold()
+            text_parts = []
 
-        for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
-            for match in pattern.finditer(text):
-                if self.PHONE_PATTERN.fullmatch(match.group()):
-                    continue
+            if extension == ".pdf":
+                reader = PdfReader(str(file_path))
+                pdf_for_ocr = pymupdf.open(str(file_path))
 
-                return re.sub(r"[^0-9Xx]", "", match.group()).upper()
+                try:
+                    for page_number in pages_to_scan(len(reader.pages)):
+                        page_text = reader.pages[page_number].extract_text() or ""
 
-        return None
+                        # OCR when text extraction did not find an ISBN-13.
+                        if not contains_isbn_13(page_text):
+                            pixmap = pdf_for_ocr[page_number].get_pixmap(dpi=200)
+                            image = Image.frombytes(
+                                "RGB",
+                                (pixmap.width, pixmap.height),
+                                pixmap.samples,
+                            )
+                            ocr_text = pytesseract.image_to_string(image)
+                            page_text = f"{page_text}\n{ocr_text}"
+
+                        text_parts.append(page_text)
+                finally:
+                    pdf_for_ocr.close()
+
+            elif extension in {".tif", ".tiff"}:
+                with Image.open(file_path) as image:
+                    frame_count = getattr(image, "n_frames", 1)
+
+                    for frame_number in pages_to_scan(frame_count):
+                        image.seek(frame_number)
+                        text_parts.append(pytesseract.image_to_string(image.copy()))
+
+            elif extension in {".jpg", ".jpeg"}:
+                with Image.open(file_path) as image:
+                    text_parts.append(pytesseract.image_to_string(image.convert("RGB")))
+
+            elif extension == ".docx":
+                document = Document(str(file_path))
+                text_parts.extend(paragraph.text for paragraph in document.paragraphs)
+                for table in document.tables:
+                    for row in table.rows:
+                        text_parts.append(" ".join(cell.text for cell in row.cells))
+
+            elif extension in {".doc", ".rtf"}:
+                try:
+                    import win32com.client
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Reading .doc and .rtf files requires pywin32. "
+                        "Install it with: python -m pip install pywin32"
+                    ) from exc
+
+                word = None
+                document = None
+                try:
+                    word = win32com.client.DispatchEx("Word.Application")
+                    word.Visible = False
+                    word.DisplayAlerts = 0
+                    document = word.Documents.Open(
+                        FileName=str(Path(file_path).resolve()),
+                        ConfirmConversions=False,
+                        ReadOnly=True,
+                        AddToRecentFiles=False,
+                        NoEncodingDialog=True,
+                    )
+                    text_parts.append(document.Content.Text)
+                finally:
+                    if document is not None:
+                        try:
+                            document.Close(SaveChanges=False)
+                        except Exception:
+                            pass
+
+                    if word is not None:
+                        try:
+                            word.Quit(SaveChanges=False)
+                        except Exception:
+                            pass
+
+            elif extension == ".epub":
+                book = epub.read_epub(str(file_path))
+                for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+                    soup = BeautifulSoup(
+                        item.get_content(),
+                        "html.parser",
+                    )
+                    text_parts.append(soup.get_text(" ", strip=True))
+
+            else:
+                raise ValueError(f"Unsupported file type: {extension}")
+
+            text = "\n".join(text_parts)
+
+            # Prefer ISBN-13 if the file contains both ISBN types.
+            for pattern in (self.ISBN_13_PATTERN, self.ISBN_10_PATTERN):
+                for match in pattern.finditer(text):
+                    if self.PHONE_PATTERN.fullmatch(match.group()):
+                        continue
+
+                    return re.sub(
+                        r"[^0-9Xx]",
+                        "",
+                        match.group(),
+                    ).upper()
+
+            return None
 
     def __init__(self):
         run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.download_dir = (
-            Path.home()
-            / "Downloads"
-            / f"sharepoint_textbook_cataloging_{run_timestamp}"
-        )
+        self.download_dir = Path.home() / "Downloads" / "sharepoint_textbook_cataloging"
         log_path = Path(__file__).with_name(f"textbook_cataloging_{run_timestamp}.log")
         self.logging_service = LogService(log_path)
         self.api_service = ApiService(logging_service=self.logging_service)
@@ -2594,24 +2859,55 @@ class TextbookCatalogingService:
                     )
                     > self.MINIMUM_ROWS_TO_LOAD
                 )
-                parent_folder = self.get_folder_by_title(driver, book_folder["title"])
+                parent_folder = self.get_folder_by_title(
+                    driver,
+                    book_folder["title"],
+                )
 
                 open_library_result = isinstance(result, dict) and str(
                     result.get("key", "")
                 ).startswith("/books/")
+
+                loc_result = (
+                    not open_library_result
+                    and isinstance(result, dict)
+                    and bool(str(result.get("title") or "").strip())
+                    and bool(result.get("isbn_13"))
+                )
+
                 google_books_result = (
-                    self.api_service.GOOGLE_BOOKS_FALLBACK_ENABLED
+                    not open_library_result
+                    and not loc_result
+                    and self.api_service.GOOGLE_BOOKS_FALLBACK_ENABLED
                     and valid_google_books_result(result)
                 )
 
-                if parent_folder and (open_library_result or google_books_result):
+                self.logging_service.write(
+                    "Open Library result:",
+                    open_library_result,
+                )
+                self.logging_service.write(
+                    "LOC result:",
+                    loc_result,
+                )
+                self.logging_service.write(
+                    "Google Books result:",
+                    google_books_result,
+                )
+
+                if parent_folder and (
+                    open_library_result or loc_result or google_books_result
+                ):
                     parent_folder["format"] = detected_formats
                     parent_folder["file_extensions"] = list(
                         book_folder.get("file_extensions") or []
                     )
                     original_title = parent_folder.get("title")
                     update_succeeded = self.update_folder_from_catalog(
-                        driver, wait, parent_folder, result
+                        driver,
+                        wait,
+                        parent_folder,
+                        result,
                     )
 
                     if not update_succeeded:
@@ -2642,11 +2938,13 @@ class TextbookCatalogingService:
                     f"details: {catalog_context!r}",
                     level=logging.ERROR,
                 )
+
             timeout_detail = str(exc).strip()
             if not timeout_detail:
                 timeout_detail = (
                     "The Selenium wait expired without providing more details."
                 )
+
             self.logging_service.write(
                 f"Timed out waiting for SharePoint "
                 f"({type(exc).__name__}): {timeout_detail}",
@@ -2671,6 +2969,7 @@ class TextbookCatalogingService:
             self.logging_service.write(
                 f"Total folder renames skipped: {self.skipped_folder_renames}"
             )
+
             if driver:
                 input("\nPress Enter to close Edge and finish the script...")
                 driver.quit()
@@ -2703,30 +3002,42 @@ def main():
     parser.add_argument(
         "--google-books-fallback",
         action="store_true",
-        help="Try Google Books if Open Library does not find a record.",
+        help=(
+            "Try Google Books if Open Library and Library of Congress "
+            "do not find a record."
+        ),
     )
     parser.add_argument(
-        "--max-folders-to-rename",
+        "--folder-rename-cap",
         type=int,
         default=50,
         help="Maximum folders to process (default 50; values above 50 are capped).",
     )
     args = parser.parse_args()
 
-    SID = args.sid.strip()
-    if not SID or Path(SID).name != SID:
-        parser.error("--SID must be your Windows user-folder name e.g. 006888191SA")
+    sid = args.sid.strip()
+    if not sid or Path(sid).name != sid:
+        parser.error(
+            "--sid must be your Windows user-folder name, " "for example 007666420SA."
+        )
+
+    if args.google_books_fallback and not os.getenv("GOOGLE_BOOKS_API_KEY", "").strip():
+        parser.error(
+            "--google-books-fallback was requested, but GOOGLE_BOOKS_API_KEY "
+            "was not found. Check that your .env file is loaded and contains the key."
+        )
 
     pytesseract.pytesseract.tesseract_cmd = str(
-        Path("C:/Users") / SID / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
+        Path("C:/Users") / sid / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
     )
+
     TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(
-        1, min(args.max_folders_to_rename, 50)
+        1, min(args.folder_rename_cap, 50)
     )
     ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = args.google_books_fallback
+
     TextbookCatalogingService()
 
 
 if __name__ == "__main__":
     main()
-    TextbookCatalogingService()
