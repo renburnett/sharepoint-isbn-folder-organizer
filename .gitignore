@@ -2,3 +2,5 @@ config.py
 __pycache__/
 *.py[cod]
 *.log
+log/
+.env
