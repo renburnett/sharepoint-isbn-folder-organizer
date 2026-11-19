@@ -19,12 +19,16 @@ The tool changes SharePoint folder names and fields. Confirm that the Edge windo
 
 ## One-time setup
 
-Create a project folder somewhere memorable, such as under Documents. Open PowerShell in the project folder:
+1. [Download Python 3 for Windows](https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe)
+
+2. [Download Files](https://github.com/renburnett/sharepoint-isbn-folder-organizer/archive/refs/heads/main.zip)
+
+3. Create a project folder somewhere memorable, such as under Documents. Open PowerShell in the project folder:
 
 ```powershell
 cd "C:\Users\<YOUR SID>\Documents\Projects\SharePointTextbookCataloging"
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.venv\Scripts\activate.bat
 ```
 
 The virtual environment keeps this project's Python packages separate from other projects on your computer. Create it once, then activate it whenever you open a new PowerShell window to work on this project. When it is active, the prompt starts with `(.venv)`.
@@ -45,16 +49,8 @@ With the virtual environment active, install the Python packages:
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install requests selenium ebooklib PyMuPDF pytesseract beautifulsoup4 python-docx Pillow pypdf python-dotenv fonttools
+python -m pip install requests selenium ebooklib PyMuPDF pytesseract beautifulsoup4 python-docx Pillow pypdf python-dotenv fonttools pywin32
 ```
-
-For `.doc` and `.rtf` files, also install:
-
-```powershell
-python -m pip install pywin32
-```
-
-Tesseract OCR and Microsoft Word are separate applications; installing Python packages does not install them.
 
 Create a `.env` file in the project folder with the settings below. Set `GOOGLE_BOOKS_FALLBACK=true` only if you want to use Google Books; the API key is required when it is enabled.
 
@@ -64,8 +60,6 @@ FOLDER_RENAME_CAP=50
 GOOGLE_BOOKS_FALLBACK=false
 GOOGLE_BOOKS_API_KEY=your_api_key_here
 ```
-
-Keep `.env` private and out of source control.
 
 ## Run the tool
 
