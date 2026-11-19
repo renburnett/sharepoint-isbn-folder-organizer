@@ -21,7 +21,7 @@ The tool changes SharePoint folder names and fields. Confirm that the Edge windo
 
 1. [Download Python 3 for Windows](https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe)
 
-2. [Download Files](https://github.com/renburnett/sharepoint-isbn-folder-organizer/archive/refs/heads/main.zip)
+2. [Download and Unzip these Files](https://github.com/renburnett/sharepoint-isbn-folder-organizer/archive/refs/heads/main.zip)
 
 3. Create a project folder somewhere memorable, such as under Documents. Open PowerShell in the project folder:
 
