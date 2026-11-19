@@ -203,6 +203,18 @@ class ApiService:
                 )
                 return None
 
+            related_item_descendant_ids = {
+                id(descendant)
+                for element in mods_record.iter()
+                if local_name(element) == "relatedItem"
+                for descendant in element.iter()
+            }
+            resource_elements = [
+                element
+                for element in mods_record.iter()
+                if id(element) not in related_item_descendant_ids
+            ]
+
             def child_text(parent, wanted_name):
                 for child in parent:
                     if local_name(child) == wanted_name:
@@ -214,25 +226,34 @@ class ApiService:
             title_info = next(
                 (
                     element
-                    for element in mods_record.iter()
+                    for element in resource_elements
                     if local_name(element) == "titleInfo"
                 ),
                 None,
             )
-            title = child_text(title_info, "title") if title_info is not None else None
+            title_parts = (
+                [
+                    child_text(title_info, part_name)
+                    for part_name in ("nonSort", "title", "partNumber", "partName")
+                ]
+                if title_info is not None
+                else []
+            )
+            title = " ".join(part for part in title_parts if part) or None
             subtitle = (
                 child_text(title_info, "subTitle") if title_info is not None else None
             )
 
             author_names = []
-            for name_element in mods_record.iter():
+            for name_element in resource_elements:
                 if local_name(name_element) != "name":
                     continue
 
                 roles = [
                     " ".join("".join(role.itertext()).split()).casefold()
                     for role in name_element.iter()
-                    if local_name(role) == "roleTerm"
+                    if id(role) not in related_item_descendant_ids
+                    and local_name(role) == "roleTerm"
                 ]
                 if roles and not any(
                     role in {"author", "aut", "creator"} for role in roles
@@ -242,7 +263,8 @@ class ApiService:
                 name_parts = [
                     " ".join("".join(part.itertext()).split())
                     for part in name_element.iter()
-                    if local_name(part) == "namePart"
+                    if id(part) not in related_item_descendant_ids
+                    and local_name(part) == "namePart"
                 ]
                 name = " ".join(part for part in name_parts if part).strip()
                 if name and name not in author_names:
@@ -253,7 +275,7 @@ class ApiService:
             editions = []
             responsibility = None
 
-            for element in mods_record.iter():
+            for element in resource_elements:
                 tag = local_name(element)
                 value = " ".join("".join(element.itertext()).split())
                 if not value:
@@ -275,8 +297,10 @@ class ApiService:
             isbn_10 = []
             isbn_13 = []
 
-            for element in mods_record.iter():
+            for element in resource_elements:
                 if local_name(element) != "identifier":
+                    continue
+                if str(element.get("invalid") or "").strip().casefold() == "yes":
                     continue
 
                 identifier_type = str(element.get("type") or "").casefold()
@@ -413,7 +437,7 @@ class ApiService:
         if loc_result:
             return loc_result
 
-        # Google Books runs only when its command-line flag is enabled.
+        # Google Books runs only when GOOGLE_BOOKS_FALLBACK is enabled in .env.
         if not self.GOOGLE_BOOKS_FALLBACK_ENABLED:
             return None
 
@@ -456,8 +480,15 @@ class ApiService:
             )
 
         except (requests.RequestException, ValueError) as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            detail = (
+                f"HTTP status {status_code}"
+                if status_code is not None
+                else "request failed or response could not be processed"
+            )
             log(
-                f"Google Books lookup failed for ISBN {normalized_isbn}: {exc}",
+                f"Google Books lookup failed for ISBN {normalized_isbn}: {detail}.",
                 level=logging.WARNING,
             )
 

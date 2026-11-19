@@ -9,7 +9,7 @@
       "program": "${workspaceFolder}/SharePointTextbookCataloging/organize_sharepoint_files.py",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
-      "args": ["--sid", "006888191SA", "--google-books-fallback"]
+      "envFile": "${workspaceFolder}/.env"
     }
   ]
 }

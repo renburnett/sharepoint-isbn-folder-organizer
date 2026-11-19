@@ -1640,6 +1640,7 @@ class TextbookCatalogingService:
             "epub": ("Epub",),
             "docx": ("Docx",),
             "doc": ("Docx",),
+            "rtf": ("Other",),
             "tif": ("TIF",),
             "tiff": ("TIF",),
             "other": ("Other",),
@@ -1899,6 +1900,7 @@ class TextbookCatalogingService:
             "docx": "docx",
             "doc": "docx",
             "word": "docx",
+            "rtf": "other",
             "tif": "tif",
             "tiff": "tif",
             "other": "other",
@@ -2190,21 +2192,31 @@ class TextbookCatalogingService:
         if not isinstance(isbn_13_value, (list, tuple)):
             isbn_13_value = [isbn_13_value]
 
-        isbn = None
-        for value in isbn_13_value:
-            candidate = re.sub(r"[^0-9]", "", str(value or ""))
-            if len(candidate) == 13 and candidate.startswith(("978", "979")):
-                isbn = candidate
-                break
-
         selected_isbn = str(getattr(self, "_selected_isbn", "") or "")
         selected_isbn = re.sub(r"[^0-9Xx]", "", selected_isbn).upper()
 
+        catalog_isbn_13_values = []
+        for value in isbn_13_value:
+            candidate = re.sub(r"[^0-9]", "", str(value or ""))
+            if (
+                len(candidate) == 13
+                and candidate.startswith(("978", "979"))
+                and candidate not in catalog_isbn_13_values
+            ):
+                catalog_isbn_13_values.append(candidate)
+
+        isbn = None
         if (
-            not isbn
-            and len(selected_isbn) == 13
+            len(selected_isbn) == 13
             and selected_isbn.startswith(("978", "979"))
+            and selected_isbn in catalog_isbn_13_values
         ):
+            isbn = selected_isbn
+        elif catalog_isbn_13_values:
+            # Keep catalog order when the requested ISBN-13 is not present.
+            isbn = catalog_isbn_13_values[0]
+        elif len(selected_isbn) == 13 and selected_isbn.startswith(("978", "979")):
+            # Retain the existing fallback for records without a catalog ISBN-13.
             isbn = selected_isbn
 
         if not isbn:
@@ -2639,6 +2651,10 @@ class TextbookCatalogingService:
                             page_text = f"{page_text}\n{ocr_text}"
 
                         text_parts.append(page_text)
+
+                        for match in self.ISBN_13_PATTERN.finditer(page_text):
+                            if not self.PHONE_PATTERN.fullmatch(match.group()):
+                                return re.sub(r"[^0-9Xx]", "", match.group()).upper()
                 finally:
                     pdf_for_ocr.close()
 
@@ -2676,6 +2692,7 @@ class TextbookCatalogingService:
                     word = win32com.client.DispatchEx("Word.Application")
                     word.Visible = False
                     word.DisplayAlerts = 0
+                    word.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
                     document = word.Documents.Open(
                         FileName=str(Path(file_path).resolve()),
                         ConfirmConversions=False,
@@ -2991,50 +3008,37 @@ class TextbookCatalogingService:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Catalog textbook folders in SharePoint."
-    )
-    parser.add_argument(
-        "--sid",
-        required=True,
-        help="Windows user-folder name used to locate Tesseract.",
-    )
-    parser.add_argument(
-        "--google-books-fallback",
-        action="store_true",
-        help=(
-            "Try Google Books if Open Library and Library of Congress "
-            "do not find a record."
-        ),
-    )
-    parser.add_argument(
-        "--folder-rename-cap",
-        type=int,
-        default=50,
-        help="Maximum folders to process (default 50; values above 50 are capped).",
-    )
-    args = parser.parse_args()
-
-    sid = args.sid.strip()
+    sid = os.getenv("SID", "").strip()
     if not sid or Path(sid).name != sid:
-        parser.error(
-            "--sid must be your Windows user-folder name, " "for example 007666420SA."
+        raise SystemExit("Set SID in .env to your Windows user-folder name.")
+
+    google_books_fallback_value = (
+        os.getenv("GOOGLE_BOOKS_FALLBACK", "false").strip().casefold()
+    )
+    if google_books_fallback_value in {"1", "true", "yes", "on"}:
+        google_books_fallback = True
+    elif google_books_fallback_value in {"", "0", "false", "no", "off"}:
+        google_books_fallback = False
+    else:
+        raise SystemExit("GOOGLE_BOOKS_FALLBACK in .env must be true or false.")
+
+    if google_books_fallback and not os.getenv("GOOGLE_BOOKS_API_KEY", "").strip():
+        raise SystemExit(
+            "GOOGLE_BOOKS_FALLBACK is enabled, but GOOGLE_BOOKS_API_KEY "
+            "is not set in .env."
         )
 
-    if args.google_books_fallback and not os.getenv("GOOGLE_BOOKS_API_KEY", "").strip():
-        parser.error(
-            "--google-books-fallback was requested, but GOOGLE_BOOKS_API_KEY "
-            "was not found. Check that your .env file is loaded and contains the key."
-        )
+    try:
+        folder_rename_cap = int(os.getenv("FOLDER_RENAME_CAP", "50").strip())
+    except ValueError:
+        raise SystemExit("FOLDER_RENAME_CAP in .env must be a whole number.")
 
     pytesseract.pytesseract.tesseract_cmd = str(
         Path("C:/Users") / sid / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
     )
 
-    TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(
-        1, min(args.folder_rename_cap, 50)
-    )
-    ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = args.google_books_fallback
+    TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(1, min(folder_rename_cap, 50))
+    ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = google_books_fallback
 
     TextbookCatalogingService()
 
