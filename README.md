@@ -14,7 +14,7 @@ The tool changes SharePoint folder names and fields. Confirm that the Edge windo
   `C:\Users\<SID>\AppData\Local\Programs\Tesseract-OCR\tesseract.exe`
   [INSTALL https://github.com/UB-Mannheim/tesseract/wiki](https://github.com/tesseract-ocr/tesseract/releases/download/5.5.3/tesseract-ocr-w64-setup-5.5.3.20260724.exe)
   If Tesseract is installed elsewhere, update the path in `main()`.
-- Install Microsoft Word and `pywin32` to scan old `.doc` and `.rtf` files. Word's Trust Center settings may block some `.doc` files. `.docx` files do not need Word.
+- Install Microsoft Word (if not already installed).
 - The script can scan PDF, EPUB, DOCX, TIF/TIFF, DOC, RTF, and JPG/JPEG files. It cannot read KES files.
 - Tesseract is needed when a PDF has no extractable text and for image-based TIFF/JPG scans. PDF files with embedded text can be read without OCR.
 
