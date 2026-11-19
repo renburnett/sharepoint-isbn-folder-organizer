@@ -57,6 +57,8 @@ Create a `.env` file in the project folder with the settings below. Set `GOOGLE_
 
 ```env
 SID=your_windows_user_folder_name
+#e.g. 420666007SA
+
 FOLDER_RENAME_CAP=50
 GOOGLE_BOOKS_FALLBACK=false
 GOOGLE_BOOKS_API_KEY=your_api_key_here
@@ -82,9 +84,7 @@ After finding an ISBN, the tool looks up catalog information in Open Library. If
 
 ## While it runs
 
-Edge opens SharePoint and the script processes folders one at a time. Leave Edge open while it runs. A spinner appears during API requests, downloads, and other longer waits. The script writes timestamped logs in the `log` folder and downloads files to a run-specific folder in your Windows Downloads directory. Temporary downloaded files are removed after scanning. When processing finishes, press Enter in the terminal to close Edge.
-
-The console and log include a final list of folders that could not be renamed.
+Edge opens SharePoint and the script processes folders one at a time. Temporary downloaded files are removed after scanning. When processing finishes, press Enter in the terminal to close Edge. The console and logfiles include a final list of folders that could not be renamed.
 
 ## If something goes wrong
 
