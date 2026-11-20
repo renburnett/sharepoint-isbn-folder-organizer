@@ -12,6 +12,9 @@ load_dotenv()
 
 class ApiService:
     API_TIMEOUT = (9, 13)  # (connect timeout, read timeout)
+    API_HEADERS = {
+        "User-Agent": ("SharePointTextbookCataloging/1.0 (renard.burnett-sa@csulb.edu)")
+    }
 
     def __init__(self, minimum_interval=1.1, logging_service=None):
         self.minimum_interval = minimum_interval
@@ -49,6 +52,7 @@ class ApiService:
 
         normalized_key = f"/authors/{match.group(1)}"
         url = f"https://openlibrary.org/authors/{match.group(1)}.json"
+        headers = self.API_HEADERS
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
@@ -57,7 +61,9 @@ class ApiService:
                 with self._spinner(
                     f"Looking up author in Open Library " f"({attempt}/{max_attempts})"
                 ):
-                    response = requests.get(url, timeout=self.API_TIMEOUT)
+                    response = requests.get(
+                        url, headers=headers, timeout=self.API_TIMEOUT
+                    )
 
                 if response.status_code == 404:
                     if self.logging_service:
@@ -389,7 +395,9 @@ class ApiService:
                 with self._spinner(
                     f"Looking up ISBN in Open Library ({attempt}/{max_attempts})"
                 ):
-                    response = requests.get(url, timeout=self.API_TIMEOUT)
+                    response = requests.get(
+                        url, headers=self.API_HEADERS, timeout=self.API_TIMEOUT
+                    )
 
                 if response.status_code == 404:
                     log(
