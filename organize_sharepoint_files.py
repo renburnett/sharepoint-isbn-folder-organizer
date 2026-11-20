@@ -3033,9 +3033,22 @@ def main():
     except ValueError:
         raise SystemExit("FOLDER_RENAME_CAP in .env must be a whole number.")
 
-    pytesseract.pytesseract.tesseract_cmd = str(
-        Path("C:/Users") / sid / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe"
+    tesseract_paths = [
+        Path("C:/Users") / sid / "AppData/Local/Programs/Tesseract-OCR/tesseract.exe",
+        Path("C:/Users") / sid / "AppData/Local/Tesseract-OCR/tesseract.exe",
+        Path("C:/Program Files/Tesseract-OCR/tesseract.exe"),
+    ]
+
+    tesseract_path = next(
+        (path for path in tesseract_paths if path.is_file()),
+        None,
     )
+
+    if tesseract_path is None:
+        checked_paths = ", ".join(str(path) for path in tesseract_paths)
+        raise SystemExit(f"Tesseract executable not found. Checked: {checked_paths}")
+
+    pytesseract.pytesseract.tesseract_cmd = str(tesseract_path)
 
     TextbookCatalogingService.MAX_FOLDERS_TO_RENAME = max(1, min(folder_rename_cap, 50))
     ApiService.GOOGLE_BOOKS_FALLBACK_ENABLED = google_books_fallback
