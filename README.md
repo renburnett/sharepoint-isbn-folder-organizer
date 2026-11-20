@@ -12,16 +12,17 @@ The tool changes SharePoint folder names and fields. Confirm that the Edge windo
 - Keep `organize_sharepoint_files.py` and the `utils` folder together. The `utils` folder must contain `api_service.py` and `logging_service.py`.
 - Install Tesseract OCR. The script builds its expected path from `SID` in `.env`:
   `C:\Users\<SID>\AppData\Local\Programs\Tesseract-OCR\tesseract.exe`
+  [INSTALL https://github.com/UB-Mannheim/tesseract/wiki](https://github.com/tesseract-ocr/tesseract/releases/download/5.5.3/tesseract-ocr-w64-setup-5.5.3.20260724.exe)
   If Tesseract is installed elsewhere, update the path in `main()`.
-- Install Microsoft Word and `pywin32` to scan old `.doc` and `.rtf` files. Word's Trust Center settings may block some `.doc` files. `.docx` files do not need Word.
+- Install Microsoft Word (if not already installed).
 - The script can scan PDF, EPUB, DOCX, TIF/TIFF, DOC, RTF, and JPG/JPEG files. It cannot read KES files.
 - Tesseract is needed when a PDF has no extractable text and for image-based TIFF/JPG scans. PDF files with embedded text can be read without OCR.
 
 ## One-time setup
 
-1. [Download Python 3 for Windows](https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe)
+1. [Download Python 3 for Windows: https://www.python.org/downloads](https://www.python.org/ftp/python/3.15.2/python-3.15.2-amd64.exe)
 
-2. [Download Files](https://github.com/renburnett/sharepoint-isbn-folder-organizer/archive/refs/heads/main.zip)
+2. [Download and Unzip these Files https://github.com/renburnett/sharepoint-isbn-folder-organizer](https://github.com/renburnett/sharepoint-isbn-folder-organizer/archive/refs/heads/main.zip)
 
 3. Create a project folder somewhere memorable, such as under Documents. Open PowerShell in the project folder:
 
@@ -56,6 +57,8 @@ Create a `.env` file in the project folder with the settings below. Set `GOOGLE_
 
 ```env
 SID=your_windows_user_folder_name
+#e.g. 420666007SA
+
 FOLDER_RENAME_CAP=50
 GOOGLE_BOOKS_FALLBACK=false
 GOOGLE_BOOKS_API_KEY=your_api_key_here
@@ -81,9 +84,7 @@ After finding an ISBN, the tool looks up catalog information in Open Library. If
 
 ## While it runs
 
-Edge opens SharePoint and the script processes folders one at a time. Leave Edge open while it runs. A spinner appears during API requests, downloads, and other longer waits. The script writes timestamped logs in the `log` folder and downloads files to a run-specific folder in your Windows Downloads directory. Temporary downloaded files are removed after scanning. When processing finishes, press Enter in the terminal to close Edge.
-
-The console and log include a final list of folders that could not be renamed.
+Edge opens SharePoint and the script processes folders one at a time. Temporary downloaded files are removed after scanning. When processing finishes, press Enter in the terminal to close Edge. The console and logfiles include a final list of folders that could not be renamed.
 
 ## If something goes wrong
 
