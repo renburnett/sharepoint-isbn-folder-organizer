@@ -89,7 +89,7 @@ Edge opens SharePoint and the script processes folders one at a time. Temporary 
 ## If something goes wrong
 
 - **A package is missing:** Activate `.venv` and install the package named in the error.
-- **Tesseract cannot be found:** Check that `SID` in `.env` exactly matches your Windows user-folder name and that the expected `tesseract.exe` path exists. If Tesseract is elsewhere, update the path in `main()`.
+- **Tesseract cannot be found:** Check that `SID` in `.env` exactly matches your Windows user-folder name (e.g. 000420666SA) and that the expected `tesseract.exe` path exists. If Tesseract is elsewhere, update the path in `main()`.
 - **An old `.doc` or `.rtf` file cannot be scanned:** Confirm Microsoft Word and `pywin32` are installed. A Trust Center policy may block `.doc`; if permitted, convert the file to `.docx` or ask your administrator about the policy.
 - **SharePoint asks you to sign in:** Sign in to Edge using an account with access to the library.
 - **A folder is skipped or a field is not updated:** Check the timestamped log for the folder, ISBN, and error details.
