@@ -12,6 +12,9 @@ load_dotenv()
 
 class ApiService:
     API_TIMEOUT = (9, 13)  # (connect timeout, read timeout)
+    API_HEADERS = {
+        "User-Agent": ("SharePointTextbookCataloging/1.0 (renard.burnett-sa@csulb.edu)")
+    }
 
     def __init__(self, minimum_interval=1.1, logging_service=None):
         self.minimum_interval = minimum_interval
@@ -49,6 +52,7 @@ class ApiService:
 
         normalized_key = f"/authors/{match.group(1)}"
         url = f"https://openlibrary.org/authors/{match.group(1)}.json"
+        headers = self.API_HEADERS
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
@@ -57,7 +61,9 @@ class ApiService:
                 with self._spinner(
                     f"Looking up author in Open Library " f"({attempt}/{max_attempts})"
                 ):
-                    response = requests.get(url, timeout=self.API_TIMEOUT)
+                    response = requests.get(
+                        url, headers=headers, timeout=self.API_TIMEOUT
+                    )
 
                 if response.status_code == 404:
                     if self.logging_service:
@@ -375,6 +381,80 @@ class ApiService:
             else:
                 print(message)
 
+        def missing_required_fields(record):
+            if not isinstance(record, dict):
+                return ["ISBN-13", "author", "title"]
+
+            missing = []
+
+            title = (
+                record.get("title")
+                or record.get("full_title")
+                or record.get("short_title")
+            )
+            if not str(title or "").strip():
+                missing.append("title")
+
+            authors = record.get("authors")
+            if isinstance(authors, (str, dict)):
+                authors = [authors]
+            elif not isinstance(authors, (list, tuple)):
+                authors = []
+
+            has_author = any(
+                (
+                    str(author or "").strip()
+                    if isinstance(author, str)
+                    else isinstance(author, dict)
+                    and any(
+                        str(author.get(field) or "").strip()
+                        for field in ("name", "personal_name", "key")
+                    )
+                )
+                for author in authors
+            )
+
+            if not has_author:
+                contributions = record.get("by_statement") or record.get(
+                    "contributions"
+                )
+                if isinstance(contributions, (list, tuple)):
+                    has_author = any(
+                        str(value or "").strip() for value in contributions
+                    )
+                else:
+                    has_author = bool(str(contributions or "").strip())
+
+            if not has_author:
+                missing.append("author")
+
+            isbn_13_values = record.get("isbn_13") or []
+            if isinstance(isbn_13_values, (str, int)):
+                isbn_13_values = [isbn_13_values]
+            elif not isinstance(isbn_13_values, (list, tuple)):
+                isbn_13_values = []
+
+            google_identifiers = record.get("industryIdentifiers") or []
+            if isinstance(google_identifiers, (list, tuple)):
+                isbn_13_values = list(isbn_13_values) + [
+                    identifier.get("identifier")
+                    for identifier in google_identifiers
+                    if isinstance(identifier, dict)
+                    and str(identifier.get("type") or "").casefold() == "isbn_13"
+                ]
+
+            has_isbn_13 = any(
+                len(value) == 13 and value.startswith(("978", "979"))
+                for value in (
+                    re.sub(r"[^0-9]", "", str(candidate or ""))
+                    for candidate in isbn_13_values
+                )
+            )
+            if not has_isbn_13:
+                missing.append("ISBN-13")
+
+            return missing
+
         normalized_isbn = re.sub(r"[^0-9Xx]", "", str(isbn or "")).upper()
         if not normalized_isbn:
             log("Cannot look up an empty or invalid ISBN.", level=logging.WARNING)
@@ -389,17 +469,33 @@ class ApiService:
                 with self._spinner(
                     f"Looking up ISBN in Open Library ({attempt}/{max_attempts})"
                 ):
-                    response = requests.get(url, timeout=self.API_TIMEOUT)
+                    response = requests.get(
+                        url,
+                        headers=self.API_HEADERS,
+                        timeout=self.API_TIMEOUT,
+                    )
 
                 if response.status_code == 404:
                     log(
-                        f"ISBN {isbn} not found in Open Library.",
+                        f"ISBN {normalized_isbn} not found in Open Library.",
                         level=logging.WARNING,
                     )
                     break
 
                 response.raise_for_status()
-                return response.json()
+                open_library_result = response.json()
+                missing = missing_required_fields(open_library_result)
+
+                if not missing:
+                    return open_library_result
+
+                log(
+                    f"Open Library returned an incomplete record for ISBN "
+                    f"{normalized_isbn}; missing {', '.join(missing)}. "
+                    "Trying the Library of Congress.",
+                    level=logging.WARNING,
+                )
+                break
 
             except requests.HTTPError as exc:
                 status_code = (
@@ -411,7 +507,7 @@ class ApiService:
 
                 log(
                     f"Open Library lookup attempt {attempt}/{max_attempts} "
-                    f"failed for ISBN {isbn}: {exc}",
+                    f"failed for ISBN {normalized_isbn}: {exc}",
                     level=logging.WARNING,
                 )
 
@@ -421,7 +517,7 @@ class ApiService:
             except requests.RequestException as exc:
                 log(
                     f"Open Library lookup attempt {attempt}/{max_attempts} "
-                    f"failed for ISBN {isbn}: {exc}",
+                    f"failed for ISBN {normalized_isbn}: {exc}",
                     level=logging.WARNING,
                 )
 
@@ -432,13 +528,26 @@ class ApiService:
             with self._spinner(f"Waiting {retry_delay} second(s) before retry"):
                 time.sleep(retry_delay)
 
-        # If Open Library has no record, try LOC.
+        # Try the Library of Congress if Open Library had no complete record.
         loc_result = self._lookup_loc_catalog(normalized_isbn, log)
         if loc_result:
-            return loc_result
+            missing = missing_required_fields(loc_result)
+            if not missing:
+                return loc_result
+
+            log(
+                f"Library of Congress returned an incomplete record for ISBN "
+                f"{normalized_isbn}; missing {', '.join(missing)}. "
+                "Trying Google Books.",
+                level=logging.WARNING,
+            )
 
         # Google Books runs only when GOOGLE_BOOKS_FALLBACK is enabled in .env.
         if not self.GOOGLE_BOOKS_FALLBACK_ENABLED:
+            log(
+                "No complete record was found; Google Books fallback is disabled.",
+                level=logging.WARNING,
+            )
             return None
 
         if not os.getenv("GOOGLE_BOOKS_API_KEY", "").strip():
@@ -470,12 +579,22 @@ class ApiService:
                     if isinstance(identifier, dict)
                 }
 
-                if normalized_isbn in result_isbns:
+                if normalized_isbn not in result_isbns:
+                    continue
+
+                missing = missing_required_fields(volume_info)
+                if not missing:
                     return volume_info
 
+                log(
+                    f"Google Books returned an incomplete record for ISBN "
+                    f"{normalized_isbn}; missing {', '.join(missing)}.",
+                    level=logging.WARNING,
+                )
+
             log(
-                f"Google Books returned no exact ISBN match for ISBN "
-                f"{normalized_isbn}.",
+                f"Google Books returned no complete exact ISBN match for "
+                f"ISBN {normalized_isbn}.",
                 level=logging.WARNING,
             )
 
@@ -492,4 +611,9 @@ class ApiService:
                 level=logging.WARNING,
             )
 
+        log(
+            f"No complete catalog record was found for ISBN {normalized_isbn}; "
+            "skipping this folder.",
+            level=logging.WARNING,
+        )
         return None
